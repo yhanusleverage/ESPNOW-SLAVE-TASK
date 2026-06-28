@@ -4,6 +4,8 @@
  */
 
 #include "MultiChannelDiscovery.h"
+#include "Config.h"
+#include <esp_task_wdt.h>
 
 // ===== CONSTRUTOR / DESTRUTOR =====
 
@@ -72,6 +74,10 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
         Serial.println("❌ Discovery: Sistema não inicializado");
         return DiscoveryResult::ERROR_ESP_NOW;
     }
+
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+    return discoverFixedChannelOnly();
+#endif
 
     if (masterChannelLocked) {
         Serial.println("🔒 Scan bloqueado — canal master conhecido");
@@ -155,9 +161,22 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
         Serial.println("⚪ Sem resposta");
     }
     
-    // ===== FASE 2: VARREDURA COMPLETA =====
+    // ===== FASE 2: VARREDURA COMPLETA (omitida se cache confiável) =====
+    if (MCD_CACHE_ENABLED && cache.successRate >= 50 &&
+        cache.lastChannel >= MCD_MIN_CHANNEL && cache.lastChannel <= MCD_MAX_CHANNEL) {
+        Serial.printf("\n📡 Fase 2: retry cache canal %u (scan completo omitido)\n",
+                      cache.lastChannel);
+        if (tryChannel(cache.lastChannel, MCD_TIMEOUT_PER_CHANNEL * 2)) {
+            unsigned long elapsedTime = millis() - startTime;
+            updateStats(true, elapsedTime, cache.lastChannel);
+            return DiscoveryResult::SUCCESS;
+        }
+        restoreAfterFailedScan();
+        return DiscoveryResult::TIMEOUT;
+    }
+
     Serial.println("\n📡 Fase 2: Varredura completa (2-5, 7-8, 10, 12-13)");
-    
+
     for (uint8_t channel = MCD_MIN_CHANNEL; channel <= MCD_MAX_CHANNEL; channel++) {
         if (abortFlag) {
             Serial.println("⚠️ Discovery abortado");
@@ -219,6 +238,48 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
     return DiscoveryResult::TIMEOUT;
 }
 
+DiscoveryResult MultiChannelDiscovery::discoverFixedChannelOnly() {
+    const uint8_t ch = ESPNOW_FIXED_CHANNEL;
+    if (ch < MCD_MIN_CHANNEL || ch > MCD_MAX_CHANNEL) {
+        Serial.printf("❌ ESPNOW_FIXED_CHANNEL inválido: %u\n", ch);
+        return DiscoveryResult::ERROR_ESP_NOW;
+    }
+
+    Serial.printf("\n📌 === DISCOVERY CANAL FIXO %u ===\n", ch);
+    masterFound = false;
+    abortFlag = false;
+    stats.totalAttempts++;
+
+    if (!setChannel(ch)) {
+        return DiscoveryResult::ERROR_ESP_NOW;
+    }
+    currentChannel = ch;
+    listenChannel = ch;
+    cache.lastChannel = ch;
+
+    Serial.printf("👂 Escuta passiva canal fixo %u (%us)\n", ch, ESPNOW_FIXED_PASSIVE_MS / 1000);
+    if (passiveListen(ch, ESPNOW_FIXED_PASSIVE_MS)) {
+        Serial.println("✅ Master encontrado no canal fixo");
+        updateStats(true, ESPNOW_FIXED_PASSIVE_MS, ch);
+        persistKnownMasterChannel(ch);
+        lockMasterChannel(true);
+        return DiscoveryResult::SUCCESS;
+    }
+
+    if (tryChannel(ch, 2000)) {
+        Serial.println("✅ Master encontrado (tryChannel canal fixo)");
+        updateStats(true, ESPNOW_FIXED_PASSIVE_MS + 2000, ch);
+        persistKnownMasterChannel(ch);
+        lockMasterChannel(true);
+        return DiscoveryResult::SUCCESS;
+    }
+
+    persistKnownMasterChannel(ch);
+    lockMasterChannel(true);
+    Serial.println("⚠️ Master sem resposta — permanece no canal fixo escutando");
+    return DiscoveryResult::TIMEOUT;
+}
+
 bool MultiChannelDiscovery::tryChannel(uint8_t channel, uint32_t timeout) {
     if (!initialized) return false;
     
@@ -234,7 +295,12 @@ bool MultiChannelDiscovery::tryChannel(uint8_t channel, uint32_t timeout) {
     if (timeoutPerAttempt < 150) timeoutPerAttempt = 150; // Mínimo 150ms por tentativa
     
     // Tentar múltiplas vezes se necessário
+    unsigned long lastWdtFeed = millis();
     for (uint8_t attempt = 0; attempt < MCD_MAX_RETRY_ATTEMPTS; attempt++) {
+        if (millis() - lastWdtFeed >= 2000) {
+            esp_task_wdt_reset();
+            lastWdtFeed = millis();
+        }
         // ✅ Enviar 2 broadcasts seguidos para aumentar chance de recepção
         sendDiscoveryBroadcast();
         delay(20);
@@ -256,6 +322,11 @@ bool MultiChannelDiscovery::tryChannel(uint8_t channel, uint32_t timeout) {
 
 DiscoveryResult MultiChannelDiscovery::rediscoverMaster(bool quickScan) {
     Serial.println("\n🔄 === RE-DISCOVERY ===");
+
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+    (void)quickScan;
+    return discoverFixedChannelOnly();
+#endif
 
     if (masterChannelLocked) {
         Serial.println("🔒 Modo bloqueado: escuta passiva + canal cache apenas");
@@ -317,9 +388,27 @@ void MultiChannelDiscovery::setRestoreChannelDelegate(McdRestoreChannelFn fn) {
     restoreChannelDelegate = fn;
 }
 
+void MultiChannelDiscovery::persistKnownMasterChannel(uint8_t channel) {
+    if (channel < MCD_MIN_CHANNEL || channel > MCD_MAX_CHANNEL) {
+        return;
+    }
+    cache.lastChannel = channel;
+    currentChannel = channel;
+    cache.usageCount++;
+    cache.successRate = min(100, (int)cache.successRate + 10);
+    if (MCD_CACHE_ENABLED) {
+        saveCacheInternal();
+    }
+    Serial.printf("[MCD] canal master %u persistido NVS (successRate=%u)\n",
+                  channel, cache.successRate);
+}
+
 void MultiChannelDiscovery::lockMasterChannel(bool locked) {
     masterChannelLocked = locked;
     if (locked) {
+        if (currentChannel >= MCD_MIN_CHANNEL && currentChannel <= MCD_MAX_CHANNEL) {
+            persistKnownMasterChannel(currentChannel);
+        }
         Serial.println("🔒 Canal master bloqueado — scan multi-canal desativado");
     }
 }
@@ -334,10 +423,16 @@ bool MultiChannelDiscovery::passiveListen(uint8_t channel, uint32_t timeoutMs) {
 
     unsigned long start = millis();
     unsigned long lastBroadcast = 0;
+    unsigned long lastWdtFeed = start;
 
     while (millis() - start < timeoutMs) {
         if (abortFlag) return false;
         if (masterFound) return true;
+
+        if (millis() - lastWdtFeed >= 2000) {
+            esp_task_wdt_reset();
+            lastWdtFeed = millis();
+        }
 
         if (sendBroadcastDelegate && (millis() - lastBroadcast > 5000)) {
             sendBroadcastDelegate();
@@ -635,11 +730,16 @@ bool MultiChannelDiscovery::sendDiscoveryBroadcast() {
 
 bool MultiChannelDiscovery::waitForMasterResponse(uint32_t timeout) {
     unsigned long start = millis();
+    unsigned long lastWdtFeed = start;
     masterFound = false;
     
     while (millis() - start < timeout) {
         if (masterFound) {
             return true;
+        }
+        if (millis() - lastWdtFeed >= 2000) {
+            esp_task_wdt_reset();
+            lastWdtFeed = millis();
         }
         delay(10);
     }
@@ -653,6 +753,10 @@ void MultiChannelDiscovery::handleReceivedMessage(const uint8_t* mac, const uint
     }
     
     ESPNowMessage* msg = (ESPNowMessage*)data;
+
+    if (masterChannelLocked) {
+        return;
+    }
     
     // ✅ Verificar se é resposta ao discovery (tipos válidos expandidos)
     if (msg->type == MessageType::DEVICE_INFO || 

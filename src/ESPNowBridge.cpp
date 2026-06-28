@@ -1,11 +1,14 @@
 #include "ESPNowBridge.h"
+#include "MultiChannelDiscovery.h"
+#include "ESPNowTypes.h"
 
 // Instância estática para callbacks
 ESPNowBridge* ESPNowBridge::instance = nullptr;
 
 ESPNowBridge::ESPNowBridge(RelayCommandBox* relayController, int channel) 
     : localRelayController(relayController), wifiChannel(channel), initialized(false), 
-      messageCounter(0), messagesSent(0), messagesReceived(0), messagesLost(0) {
+      messageCounter(0), messagesSent(0), messagesReceived(0), messagesLost(0),
+      lastAllRelaysSentMs(0) {
     instance = this;
     
     // FASE 2: Criar instância do ESPNowController
@@ -720,6 +723,15 @@ void ESPNowBridge::onWiFiCredentialsReceived(const String& ssid, const String& p
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     instance->wifiChannel = channel;
     Serial.println("   ✅ Canal ESP-NOW sincronizado: " + String(channel));
+
+    extern MultiChannelDiscovery* multiChannelDiscovery;
+    if (multiChannelDiscovery) {
+        multiChannelDiscovery->persistKnownMasterChannel(channel);
+        multiChannelDiscovery->lockMasterChannel(true);
+    }
+    if (instance->espNowController) {
+        instance->espNowController->setDiscoverySuppressed(true);
+    }
     
     // Conectar ao WiFi
     Serial.println("\n🔌 Conectando ao WiFi...");
@@ -904,6 +916,87 @@ void ESPNowBridge::printStatus() {
     Serial.println("================================\n");
 }
 
+// ===== RELAY ACK + ALL_RELAYS (throttled) =====
+
+bool ESPNowBridge::sendAllRelaysStatusToMaster(const uint8_t* senderMac, bool force) {
+    return sendAllRelaysStatusToMasterInternal(senderMac, force);
+}
+
+bool ESPNowBridge::sendAllRelaysStatusToMasterInternal(const uint8_t* senderMac, bool force) {
+    if (!initialized || !senderMac || !localRelayController) {
+        return false;
+    }
+
+    unsigned long now = millis();
+    if (!force && lastAllRelaysSentMs > 0 &&
+        (now - lastAllRelaysSentMs) < ALL_RELAYS_THROTTLE_MS) {
+        return false;
+    }
+
+    AllRelaysStatus allStatus;
+    allStatus.timestamp = now;
+    allStatus.numRelays = 8;
+
+    for (int i = 0; i < 8; i++) {
+        allStatus.relays[i].state = localRelayController->getRelayState(i) ? 1 : 0;
+        allStatus.relays[i].hasTimer = 0;
+        allStatus.relays[i].remainingTime = 0;
+    }
+
+    allStatus.checksum = 0;
+    uint8_t* ptr = (uint8_t*)&allStatus;
+    for (size_t i = 0; i < sizeof(AllRelaysStatus) - 1; i++) {
+        allStatus.checksum ^= ptr[i];
+    }
+
+    ESPNowMessage statusMsg = {};
+    statusMsg.type = MessageType::ALL_RELAYS_STATUS;
+    WiFi.macAddress(statusMsg.senderId);
+    memcpy(statusMsg.targetId, senderMac, 6);
+    statusMsg.messageId = ++messageCounter;
+    statusMsg.timestamp = now;
+    statusMsg.dataSize = sizeof(AllRelaysStatus);
+    memcpy(statusMsg.data, &allStatus, sizeof(AllRelaysStatus));
+    statusMsg.checksum = calculateChecksum(statusMsg);
+
+    if (!sendMessage(statusMsg, senderMac)) {
+        return false;
+    }
+
+    lastAllRelaysSentMs = now;
+    Serial.println("📤 ALL_RELAYS enviado (throttle=" + String(ALL_RELAYS_THROTTLE_MS / 1000) + "s)");
+    return true;
+}
+
+void ESPNowBridge::finalizeRelayCommandExecution(const uint8_t* senderMac, uint32_t commandId,
+                                                 int relayNumber, bool commandOk,
+                                                 bool forceAllRelays) {
+    if (!espNowController || !senderMac) {
+        return;
+    }
+
+    bool currentState = localRelayController && relayNumber >= 0 && relayNumber < 8
+        ? localRelayController->getRelayState(relayNumber) : false;
+
+    RelayCommandAck ack = {};
+    ack.commandId = commandId;
+    ack.relayNumber = (uint8_t)relayNumber;
+    ack.success = commandOk ? 1 : 0;
+    ack.currentState = currentState ? 1 : 0;
+    ack.timestamp = millis();
+
+    bool ackSent = espNowController->sendRelayCommandAck(senderMac, ack);
+    if (ackSent) {
+        Serial.printf("✅ RELAY_ACK enviado id=%u R%d state=%s\n",
+                      (unsigned)ack.commandId, relayNumber, currentState ? "ON" : "OFF");
+    } else {
+        Serial.println("⚠️ Falha ao enviar RELAY_ACK");
+    }
+
+    // ALL_RELAYS imediato só após ACK OK; throttle mantido para sync periódico
+    sendAllRelaysStatusToMasterInternal(senderMac, ackSent || forceAllRelays);
+}
+
 // ===== MÉTODOS PRIVADOS (COMPATIBILIDADE) =====
 
 bool ESPNowBridge::sendMessage(const ESPNowMessage& message, const uint8_t* targetMac) {
@@ -960,67 +1053,40 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
                     #ifdef SLAVE_MODE
                     extern RelayCommandBox relayBox;
                     
-                    String action = String(cmdData.action);
-                    Serial.println("⚡ Executando comando no RelayBox...");
-                    
-                    if (action == "on") {
-                        if (cmdData.duration > 0) {
-                            relayBox.setRelayWithTimer(cmdData.relayNumber, true, cmdData.duration);
-                        } else {
-                            relayBox.setRelay(cmdData.relayNumber, true);
-                        }
-                        Serial.println("✅ Relé " + String(cmdData.relayNumber) + " LIGADO");
-                    } else if (action == "off") {
-                        relayBox.setRelay(cmdData.relayNumber, false);
-                        Serial.println("✅ Relé " + String(cmdData.relayNumber) + " DESLIGADO");
-                    } else if (action == "toggle") {
-                        relayBox.toggleRelay(cmdData.relayNumber);
-                        Serial.println("✅ Relé " + String(cmdData.relayNumber) + " ALTERNADO");
-                    }
-                    
-                    // 🔄 FASE 3: Enviar estado de TODOS os relays de volta ao MASTER
-                    Serial.println("\n📤 Enviando estado de TODOS os relays ao MASTER...");
-                    
-                    // Incluir ESPNowTypes.h para AllRelaysStatus
-                    #include "ESPNowTypes.h"
-                    
-                    // Coletar estado de todos os relays
-                    AllRelaysStatus allStatus;
-                    allStatus.timestamp = millis();
-                    allStatus.numRelays = 8;
-                    
-                    for (int i = 0; i < 8; i++) {
-                        allStatus.relays[i].state = relayBox.getRelayState(i) ? 1 : 0;
-                        allStatus.relays[i].hasTimer = 0; // TODO: Implementar detecção de timer ativo
-                        allStatus.relays[i].remainingTime = 0; // TODO: Implementar obtenção de tempo restante
-                    }
-                    
-                    // Calcular checksum simples
-                    allStatus.checksum = 0;
-                    uint8_t* ptr = (uint8_t*)&allStatus;
-                    for (size_t i = 0; i < sizeof(AllRelaysStatus) - 1; i++) {
-                        allStatus.checksum ^= ptr[i];
-                    }
-                    
-                    // Criar mensagem ESP-NOW
-                    ESPNowMessage statusMsg = {};
-                    statusMsg.type = MessageType::ALL_RELAYS_STATUS;
-                    WiFi.macAddress(statusMsg.senderId);
-                    memcpy(statusMsg.targetId, senderMac, 6);
-                    statusMsg.messageId = ++messageCounter;
-                    statusMsg.timestamp = millis();
-                    statusMsg.dataSize = sizeof(AllRelaysStatus);
-                    memcpy(statusMsg.data, &allStatus, sizeof(AllRelaysStatus));
-                    statusMsg.checksum = calculateChecksum(statusMsg);
-                    
-                    // Enviar estado completo
-                    if (sendMessage(statusMsg, senderMac)) {
-                        Serial.println("✅ Estado completo de todos os relays enviado!");
-                        Serial.println("📊 " + String(allStatus.numRelays) + " relays sincronizados");
+                String action = String(cmdData.action);
+                Serial.println("⚡ Executando comando no RelayBox...");
+
+                uint32_t ackCommandId = cmdData.commandId;
+                if (ackCommandId == 0) {
+                    ackCommandId = message.messageId;
+                }
+                
+                bool commandOk = true;
+                if (action == "status" || action == "STATUS") {
+                    Serial.println("📊 Status solicitado — sync ALL_RELAYS");
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, true, true);
+                } else if (action == "on") {
+                    if (cmdData.duration > 0) {
+                        relayBox.setRelayWithTimer(cmdData.relayNumber, true, cmdData.duration);
                     } else {
-                        Serial.println("❌ Falha ao enviar estado dos relays");
+                        relayBox.setRelay(cmdData.relayNumber, true);
                     }
-                    #endif
+                    Serial.println("✅ Relé " + String(cmdData.relayNumber) + " LIGADO");
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
+                } else if (action == "off") {
+                    relayBox.setRelay(cmdData.relayNumber, false);
+                    Serial.println("✅ Relé " + String(cmdData.relayNumber) + " DESLIGADO");
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
+                } else if (action == "toggle") {
+                    relayBox.toggleRelay(cmdData.relayNumber);
+                    Serial.println("✅ Relé " + String(cmdData.relayNumber) + " ALTERNADO");
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
+                } else {
+                    commandOk = false;
+                    Serial.println("❌ Ação desconhecida: " + action);
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, false, false);
+                }
+                #endif
                 }
             }
             break;
@@ -1159,6 +1225,9 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
             Serial.println("📊 Connectivity Report recebido de: " + macToString(senderMac));
             break;
         }
+
+        case MessageType::BROADCAST:
+            break;
         
         default:
             Serial.println("❓ Tipo de mensagem ESP-NOW desconhecido: " + String((int)message.type));

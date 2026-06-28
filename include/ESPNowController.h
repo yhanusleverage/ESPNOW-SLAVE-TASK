@@ -16,6 +16,7 @@
 
 // Incluir WiFiCredentialsManager para estrutura WiFiCredentialsData
 #include "WiFiCredentialsManager.h"
+#include "ESPNowTypes.h"
 
 /**
  * @brief Tipos de mensagem ESP-NOW
@@ -58,7 +59,10 @@ struct RelayCommandData {
     int relayNumber;           // Número do relé (0-7)
     bool state;               // Estado desejado
     int duration;             // Duração em segundos (0 = sem timer)
-    char action[12];          // "on", "off", "toggle", "status"
+    char action[12];          // "on", "off", "toggle", "status", "timed_on", "cycle", ...
+    uint32_t commandId;       // ID do comando (master) para ACK
+    int cycleOffDuration;     // OFF seconds for cycle mode (0 = not cycle)
+    char mode[12];            // "instant","timed_on","timed_off","cycle","cycle_stop"
 } __attribute__((packed));
 
 /**
@@ -215,6 +219,14 @@ public:
      * @brief Garante peer broadcast no canal atual
      */
     bool ensureBroadcastPeer();
+
+    /**
+     * @brief ACK ligero por comando de relé (TASK_MSG_RELAY_ACK)
+     */
+    bool sendRelayCommandAck(const uint8_t* targetMac, const RelayCommandAck& ack);
+
+    void setDiscoverySuppressed(bool suppressed) { discoverySuppressed = suppressed; }
+    bool isDiscoverySuppressed() const { return discoverySuppressed; }
 
     int getWifiChannel() const { return wifiChannel; }
     
@@ -454,6 +466,7 @@ private:
     String deviceName;                    // Nome do dispositivo local
     int wifiChannel;                     // Canal WiFi
     bool initialized;                    // Status de inicialização
+    bool discoverySuppressed;            // Skip auto-discovery cuando link locked
     uint32_t messageCounter;            // Contador de mensagens enviadas
     
     // Estatísticas

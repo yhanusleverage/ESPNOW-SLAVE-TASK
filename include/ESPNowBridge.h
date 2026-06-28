@@ -14,6 +14,7 @@
 
 // Incluir ESPNowController do ESPNOW-CARGA
 #include "ESPNowController.h"
+#include "ESPNowTypes.h"
 
 // Usar estruturas do ESPNowController para compatibilidade
 // (As estruturas já estão definidas no ESPNowController.h)
@@ -98,6 +99,9 @@ public:
      * @brief Garante peer broadcast no canal atual
      */
     bool ensureBroadcastPeer();
+
+    /** Forzar sync ALL_RELAYS (p.ej. reconexión) */
+    bool sendAllRelaysStatusToMaster(const uint8_t* senderMac, bool force = false);
     
     /**
      * @brief Envia credenciais WiFi em broadcast para todos os dispositivos
@@ -307,6 +311,13 @@ private:
     void (*deviceDiscoveryCallback)(const uint8_t* mac, const String& name, const String& type, bool operational) = nullptr;
     void (*errorCallback)(const String& error) = nullptr;
     void (*messageReceivedCallback)(const uint8_t* mac, const uint8_t* data, int len) = nullptr;
+
+    static const unsigned long ALL_RELAYS_THROTTLE_MS = 3000;
+    unsigned long lastAllRelaysSentMs = 0;
+
+    void finalizeRelayCommandExecution(const uint8_t* senderMac, uint32_t commandId,
+                                       int relayNumber, bool commandOk, bool forceAllRelays = false);
+    bool sendAllRelaysStatusToMasterInternal(const uint8_t* senderMac, bool force);
     
     // ===== MÉTODOS PRIVADOS =====
     

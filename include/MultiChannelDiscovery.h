@@ -192,12 +192,18 @@ public:
      * @brief Bloqueia scan multi-canal após canal master conhecido
      */
     void lockMasterChannel(bool locked);
+
+    /** Persiste canal conhecido do master em NVS (evita reboot em canal errado) */
+    void persistKnownMasterChannel(uint8_t channel);
     bool isMasterChannelLocked() const { return masterChannelLocked; }
 
     /**
      * @brief Escuta passiva no canal NVS antes de scan ativo
      */
     bool passiveListen(uint8_t channel, uint32_t timeoutMs = MCD_PASSIVE_LISTEN_MS);
+
+    /** Discovery só no canal fixo (ESPNOW_FIXED_CHANNEL_ENABLED) */
+    DiscoveryResult discoverFixedChannelOnly();
     
     // ===== GETTERS =====
     

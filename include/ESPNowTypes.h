@@ -79,7 +79,7 @@ struct RelayCommandAck {
     uint8_t currentState;     // Estado atual do relé (0=OFF, 1=ON)
     uint32_t timestamp;       // Quando foi executado
     uint8_t checksum;         // Checksum
-};
+} __attribute__((packed));
 
 // ===== 🔄 FASE 3: SINCRONIZAÇÃO DE ESTADO DE TODOS OS RELAYS =====
 /**

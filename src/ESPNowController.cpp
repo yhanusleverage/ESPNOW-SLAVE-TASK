@@ -30,8 +30,8 @@ class MasterSlaveManager;
 ESPNowController* ESPNowController::instance = nullptr;
 
 ESPNowController::ESPNowController(const String& deviceName, int channel) 
-    : deviceName(deviceName), wifiChannel(channel), initialized(false), messageCounter(0),
-      messagesSent(0), messagesReceived(0), messagesLost(0), lastMessageId(0) {
+    : deviceName(deviceName), wifiChannel(channel), initialized(false), discoverySuppressed(false),
+      messageCounter(0), messagesSent(0), messagesReceived(0), messagesLost(0), lastMessageId(0) {
     instance = this;
 }
 
@@ -115,9 +115,12 @@ void ESPNowController::update() {
         lastCleanup = millis();
     }
     
-    // ✅ CORREÇÃO BUG #5: Discovery periódico (a cada 30s)
+    if (discoverySuppressed) {
+        return;
+    }
+
     static unsigned long lastDiscovery = 0;
-    if (millis() - lastDiscovery > 30000) {  // 30 segundos
+    if (millis() - lastDiscovery > 30000) {
         Serial.println("🔍 Auto-discovery: Procurando novos dispositivos...");
         sendDiscoveryBroadcast();
         lastDiscovery = millis();
@@ -261,6 +264,43 @@ bool ESPNowController::sendDiscoveryBroadcast() {
     
     uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     return sendDeviceInfo(nullptr, "RelayCommandBox", 8, true, millis(), ESP.getFreeHeap());
+}
+
+bool ESPNowController::sendRelayCommandAck(const uint8_t* targetMac, const RelayCommandAck& ack) {
+    if (!initialized || !targetMac) {
+        return false;
+    }
+
+    TaskESPNowMessage taskMsg = {};
+    taskMsg.type = TASK_MSG_RELAY_ACK;
+    WiFi.macAddress(taskMsg.senderMac);
+    memcpy(taskMsg.targetMac, targetMac, 6);
+    taskMsg.timestamp = millis();
+    taskMsg.dataSize = sizeof(RelayCommandAck);
+
+    RelayCommandAck ackCopy = ack;
+    uint8_t checksum = 0;
+    uint8_t* data = reinterpret_cast<uint8_t*>(&ackCopy);
+    for (size_t i = 0; i < sizeof(RelayCommandAck) - 1; i++) {
+        checksum ^= data[i];
+    }
+    ackCopy.checksum = checksum;
+    memcpy(taskMsg.data, &ackCopy, sizeof(RelayCommandAck));
+
+    uint8_t msgChecksum = 0;
+    uint8_t* msgData = reinterpret_cast<uint8_t*>(&taskMsg);
+    for (size_t i = 0; i < sizeof(TaskESPNowMessage) - 1; i++) {
+        msgChecksum ^= msgData[i];
+    }
+    taskMsg.checksum = msgChecksum;
+
+    esp_err_t result = esp_now_send(targetMac, reinterpret_cast<uint8_t*>(&taskMsg), sizeof(TaskESPNowMessage));
+    if (result == ESP_OK) {
+        messagesSent++;
+        return true;
+    }
+    messagesLost++;
+    return false;
 }
 
 bool ESPNowController::syncRadioChannel(uint8_t channel) {

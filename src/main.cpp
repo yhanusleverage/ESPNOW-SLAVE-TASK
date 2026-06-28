@@ -234,6 +234,10 @@ void setup() {
         multiChannelDiscovery->setProgressCallback(onDiscoveryProgress);
         
         ChannelCache cache = multiChannelDiscovery->getCache();
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+        masterChannel = ESPNOW_FIXED_CHANNEL;
+        Serial.printf("📌 Modo canal FIXO: %u (sem scan multi-canal)\n", masterChannel);
+#else
         if (cache.lastChannel > 0 && cache.lastChannel <= 13) {
             masterChannel = cache.lastChannel;
             Serial.println("📦 Canal carregado do cache: " + String(masterChannel));
@@ -241,6 +245,7 @@ void setup() {
             masterChannel = 1;
             Serial.println("📶 Canal padrão: " + String(masterChannel));
         }
+#endif
     } else {
         Serial.println("❌ Erro ao inicializar MultiChannelDiscovery");
         masterChannel = 1;
@@ -278,6 +283,28 @@ void setup() {
     }
     
     espNowBridge->syncRadioChannel(masterChannel);
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+    if (multiChannelDiscovery) {
+        multiChannelDiscovery->persistKnownMasterChannel(masterChannel);
+        multiChannelDiscovery->lockMasterChannel(true);
+    }
+    if (espNowBridge->getESPNowController()) {
+        espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
+    }
+    Serial.printf("🔒 Boot canal fixo %u — MCD locked, scan 1-13 desativado\n", masterChannel);
+#else
+    if (multiChannelDiscovery) {
+        ChannelCache bootCache = multiChannelDiscovery->getCache();
+        if (bootCache.lastChannel >= 1 && bootCache.lastChannel <= 13 &&
+            bootCache.successRate >= 50) {
+            multiChannelDiscovery->lockMasterChannel(true);
+            if (espNowBridge->getESPNowController()) {
+                espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
+            }
+            Serial.printf("🔒 Boot: cache confiável canal %u — scan completo adiado\n", masterChannel);
+        }
+    }
+#endif
     
     // 4. SafetyWatchdog
     Serial.println("\n🛡️ FASE 4: Inicializando SafetyWatchdog...");
@@ -1907,9 +1934,12 @@ void scanChannelsForMaster() {
  * @brief Callback quando Master é encontrado
  */
 void onMasterFound(uint8_t channel, const uint8_t* masterMac) {
-    Serial.println("\n🎯 ========================================");
-    Serial.println("🎯 === CALLBACK: MASTER ENCONTRADO! ===");
-    Serial.println("🎯 ========================================");
+    if (channelSyncCompleted && channel == masterChannel &&
+        multiChannelDiscovery && multiChannelDiscovery->isMasterChannelLocked()) {
+        return;
+    }
+
+    Serial.println("\n🎯 === CALLBACK: MASTER ENCONTRADO! ===");
     Serial.println("📶 Canal Master: " + String(channel));
     Serial.printf("🆔 MAC Master: %02X:%02X:%02X:%02X:%02X:%02X\n",
                  masterMac[0], masterMac[1], masterMac[2], 
@@ -1945,51 +1975,27 @@ void onMasterFound(uint8_t channel, const uint8_t* masterMac) {
     
     Serial.println("========================================\n");
     
-    // 🚨 CRÍTICO: Enviar DeviceInfo automaticamente quando Master é encontrado
-    // Isso garante que o Master registre o Slave imediatamente
-    if (espNowBridge) {
+    bool needsDeviceInfo = !channelSyncCompleted || (channel != masterChannel);
+    if (needsDeviceInfo && espNowBridge) {
         ESPNowController* controller = espNowBridge->getESPNowController();
         if (controller) {
-            Serial.println("\n📤 [AUTO] Enviando DeviceInfo para Master recém-descoberto...");
-            Serial.println("   💡 Master precisa registrar este Slave em trustedSlaves");
-            Serial.println("   📶 Canal: " + String(channel));
-            
-            bool sent = controller->sendDeviceInfo(
-                masterMac,           // Para o Master recém-descoberto
-                "RelayBox",          // Tipo do dispositivo
-                8,                   // 8 relés disponíveis
-                true,                // Operacional
-                millis(),            // Uptime atual
-                ESP.getFreeHeap()    // Memória livre
-            );
-            
-            if (sent) {
-                Serial.println("✅ DeviceInfo enviado automaticamente ao Master!");
-                Serial.println("🎯 Master deve registrar este Slave agora");
-            } else {
-                Serial.println("❌ Falha ao enviar DeviceInfo automaticamente");
-                Serial.println("💡 Tentando novamente em 300ms...");
-                delay(300);
-                sent = controller->sendDeviceInfo(
-                    masterMac, "RelayBox", 8, true, millis(), ESP.getFreeHeap()
-                );
-                if (sent) {
-                    Serial.println("✅ DeviceInfo re-enviado com sucesso!");
-                } else {
-                    Serial.println("❌ Falha definitiva - Master pode não registrar este Slave");
-                }
-            }
+            Serial.println("📤 [AUTO] Enviando DeviceInfo ao Master...");
+            controller->sendDeviceInfo(
+                masterMac, "RelayBox", 8, true, millis(), ESP.getFreeHeap());
         }
     }
     
-    // Atualizar flags
     channelSyncCompleted = true;
     masterConnected = true;
     failedPingCount = 0;
     masterChannel = channel;
 
     if (multiChannelDiscovery) {
+        multiChannelDiscovery->persistKnownMasterChannel(channel);
         multiChannelDiscovery->lockMasterChannel(true);
+    }
+    if (espNowBridge && espNowBridge->getESPNowController()) {
+        espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
     }
 }
 
@@ -2039,8 +2045,15 @@ void performRediscoveryIfNeeded() {
     
     bool needsRediscovery = false;
     
-    // Condição 0: nunca encontrou master — escuta passiva 45s antes do primeiro scan
+    // Condição 0: nunca encontrou master
     if (!masterConnected && !channelSyncCompleted) {
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+        if (millis() - slaveBootMs < 5000) {
+            return;
+        }
+        needsRediscovery = true;
+        rediscoveryInterval = 15000;
+#else
         if (millis() - slaveBootMs < SLAVE_REDISCOVERY_INITIAL_MS) {
             return;
         }
@@ -2053,6 +2066,7 @@ void performRediscoveryIfNeeded() {
                            "s no canal NVS antes do scan...");
             firstAttempt = false;
         }
+#endif
     }
     
     if (watchdog.isSafetyMode()) {
@@ -2067,10 +2081,17 @@ void performRediscoveryIfNeeded() {
     
     if (!masterConnected && channelSyncCompleted) {
         needsRediscovery = true;
-        if (multiChannelDiscovery) {
-            multiChannelDiscovery->lockMasterChannel(false);
-        }
         rediscoveryInterval = SLAVE_REDISCOVERY_INITIAL_MS;
+#if !ESPNOW_FIXED_CHANNEL_ENABLED
+        if (failedPingCount >= maxFailedPings) {
+            if (multiChannelDiscovery) {
+                multiChannelDiscovery->lockMasterChannel(false);
+            }
+            if (espNowBridge && espNowBridge->getESPNowController()) {
+                espNowBridge->getESPNowController()->setDiscoverySuppressed(false);
+            }
+        }
+#endif
     }
     
     if (needsRediscovery && (millis() - lastRediscoveryAttempt > rediscoveryInterval)) {
@@ -2095,7 +2116,11 @@ void performRediscoveryIfNeeded() {
             masterConnected = true;
             failedPingCount = 0;
             channelSyncCompleted = true;
+            multiChannelDiscovery->persistKnownMasterChannel(newChannel);
             multiChannelDiscovery->lockMasterChannel(true);
+            if (espNowBridge && espNowBridge->getESPNowController()) {
+                espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
+            }
             rediscoveryInterval = SLAVE_REDISCOVERY_INITIAL_MS;
             
         } else if (result != DiscoveryResult::BLOCKED) {
