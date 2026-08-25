@@ -21,6 +21,10 @@
 #define DEBUG_PRINTF(format, ...) if(SERIAL_DEBUG_ENABLED) Serial.printf(format, ##__VA_ARGS__)
 #endif
 
+#ifndef ESPNOW_LOCK_DEBUG
+#define ESPNOW_LOCK_DEBUG 1
+#endif
+
 // ===== CONFIGURAÇÕES GERAIS =====
 #define SYSTEM_VERSION "2.1"
 // DEVICE_ID será generado automáticamente usando MAC address
@@ -117,6 +121,17 @@
 // Status LED
 #define STATUS_LED_PIN 2               // LED de status (built-in)
 
+// Relé watchdog externo (pulso GPIO — se parar, relé externo corta bombas)
+#ifndef HW_WATCHDOG_ENABLED
+#define HW_WATCHDOG_ENABLED 1
+#endif
+#ifndef HW_WATCHDOG_GPIO
+#define HW_WATCHDOG_GPIO 26            // GPIO livre; ligar ao relé watchdog externo
+#endif
+#ifndef HW_WATCHDOG_PULSE_INTERVAL_MS
+#define HW_WATCHDOG_PULSE_INTERVAL_MS 5000
+#endif
+
 // ===== ENDEREÇOS I2C =====
 #define PCF8574_ADDR_1 0x20           // Primeiro PCF8574
 #define PCF8574_ADDR_2 0x24           // Segundo PCF8574 (se usado)
@@ -163,6 +178,12 @@
 
 // ===== CONFIGURAÇÕES DE RELÉS =====
 #define MAX_RELAYS 8   // Sistema Master ESP-NOW com 8 relés
+
+/** 0 = após reboot o slave volta ao ON/OFF guardado em NVS (pedido produto).
+ *  1 = tudo OFF até o Master mandar (fotoperíodo estrito). */
+#ifndef RELAY_SAFE_BOOT_ALWAYS_OFF
+#define RELAY_SAFE_BOOT_ALWAYS_OFF 0
+#endif
 
 // Mapeamento de relés para pinos PCF8574 (permite pular pinos defeituosos)
 // Formato: {pcf_chip, pin_number, enabled}

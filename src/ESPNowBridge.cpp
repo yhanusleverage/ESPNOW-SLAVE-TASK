@@ -1,6 +1,28 @@
 #include "ESPNowBridge.h"
 #include "MultiChannelDiscovery.h"
 #include "ESPNowTypes.h"
+#include <string.h>
+
+static String normalizeRelayAction(const char* raw, size_t maxLen = 12) {
+    char buf[16];
+    memset(buf, 0, sizeof(buf));
+    if (raw) {
+        memcpy(buf, raw, maxLen < 15 ? maxLen : 15);
+    }
+    String a = String(buf);
+    a.trim();
+    a.toLowerCase();
+    return a;
+}
+
+static bool isTimedOnAction(const String& a) {
+    return a == "on" || a == "timed_on" || a.startsWith("timed");
+}
+
+static bool isCycleAction(const String& a, const String& mode) {
+    return a == "cycle" || mode == "cycle" ||
+           (a.startsWith("cycle") && a.indexOf("stop") < 0);
+}
 
 // Instância estática para callbacks
 ESPNowBridge* ESPNowBridge::instance = nullptr;
@@ -399,13 +421,17 @@ bool ESPNowBridge::requestConnectivityCheck(const uint8_t* targetMac) {
     return success;
 }
 
-bool ESPNowBridge::sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId) {
+bool ESPNowBridge::sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId, int operationalOverride) {
     if (!initialized || !espNowController) {
         Serial.println("❌ ESP-NOW não inicializado");
         return false;
     }
+
+    if (operationalOverride < 0 && localRelayController) {
+        operationalOverride = localRelayController->isOperational() ? 1 : 0;
+    }
     
-    bool success = espNowController->sendConnectivityReport(targetMac, sessionId);
+    bool success = espNowController->sendConnectivityReport(targetMac, sessionId, operationalOverride);
     if (success) {
         String targetStr = targetMac ? macToString(targetMac) : "BROADCAST";
         Serial.println("📊 Relatório de conectividade enviado para: " + targetStr);
@@ -492,26 +518,33 @@ void ESPNowBridge::onRelayCommandReceived(const uint8_t* senderMac, int relayNum
         Serial.println("\n⚡ Executando comando no RelayController local...");
         
         #ifdef SLAVE_MODE
-        // No modo Slave, executar o comando recebido
-        if (action == "on" || action == "ON") {
+        String act = action;
+        act.trim();
+        act.toLowerCase();
+        bool hwOk = false;
+        bool handled = true;
+        if (isTimedOnAction(act)) {
             if (duration > 0) {
-                instance->localRelayController->setRelayWithTimer(relayNumber, true, duration);
-                Serial.println("✅ Relé " + String(relayNumber) + " LIGADO por " + String(duration) + " segundos");
-                Serial.println("⏲️  Timer ativo - Desligará automaticamente");
+                hwOk = instance->localRelayController->setRelayWithTimer(relayNumber, true, duration);
             } else {
-                instance->localRelayController->setRelay(relayNumber, true);
-                Serial.println("✅ Relé " + String(relayNumber) + " LIGADO permanentemente");
-                Serial.println("⚠️  Sem timer - Ficará ligado até comando OFF");
+                hwOk = instance->localRelayController->setRelay(relayNumber, true);
             }
-        } else if (action == "off" || action == "OFF") {
-            instance->localRelayController->setRelay(relayNumber, false);
-            Serial.println("✅ Relé " + String(relayNumber) + " DESLIGADO");
-        } else if (action == "toggle" || action == "TOGGLE") {
-            instance->localRelayController->toggleRelay(relayNumber);
-            Serial.println("✅ Relé " + String(relayNumber) + " ALTERNADO");
+        } else if (act == "off") {
+            hwOk = instance->localRelayController->setRelay(relayNumber, false);
+        } else if (act == "toggle") {
+            hwOk = instance->localRelayController->toggleRelay(relayNumber);
+        } else if (isCycleAction(act, "")) {
+            uint32_t offSec = duration > 0 ? (uint32_t)duration : 1;
+            hwOk = instance->localRelayController->startCycle(relayNumber, duration > 0 ? (uint32_t)duration : 1, offSec);
+        } else if (act == "cycle_stop" || act.startsWith("cycle_stop")) {
+            hwOk = instance->localRelayController->stopCycle(relayNumber);
         } else {
+            handled = false;
             Serial.println("❌ Ação desconhecida: " + action);
-            Serial.println("💡 Ações válidas: on, off, toggle");
+            Serial.println("💡 Ações válidas: on, off, toggle, timed_on, cycle, cycle_stop");
+        }
+        if (handled) {
+            Serial.println(hwOk ? "✅ Hardware OK" : "❌ Hardware FALHOU — não enviar ACK de sucesso");
         }
         #else
         Serial.println("⚠️ Modo SLAVE não está ativado (#define SLAVE_MODE)");
@@ -937,10 +970,16 @@ bool ESPNowBridge::sendAllRelaysStatusToMasterInternal(const uint8_t* senderMac,
     allStatus.timestamp = now;
     allStatus.numRelays = 8;
 
+    uint8_t mask = 0;
     for (int i = 0; i < 8; i++) {
-        allStatus.relays[i].state = localRelayController->getRelayState(i) ? 1 : 0;
-        allStatus.relays[i].hasTimer = 0;
-        allStatus.relays[i].remainingTime = 0;
+        bool on = localRelayController->getRelayState(i);
+        allStatus.relays[i].state = on ? 1 : 0;
+        int remaining = localRelayController->getRemainingTime(i);
+        allStatus.relays[i].hasTimer = remaining > 0 ? 1 : 0;
+        allStatus.relays[i].remainingTime = (uint16_t)constrain(remaining, 0, 65535);
+        if (on) {
+            mask |= (uint8_t)(1u << i);
+        }
     }
 
     allStatus.checksum = 0;
@@ -964,7 +1003,10 @@ bool ESPNowBridge::sendAllRelaysStatusToMasterInternal(const uint8_t* senderMac,
     }
 
     lastAllRelaysSentMs = now;
-    Serial.println("📤 ALL_RELAYS enviado (throttle=" + String(ALL_RELAYS_THROTTLE_MS / 1000) + "s)");
+    Serial.printf("📤 ALL_RELAYS mask=0x%02X pcf=%d (throttle=%lus)\n",
+                  mask,
+                  localRelayController->isOperational() ? 1 : 0,
+                  ALL_RELAYS_THROTTLE_MS / 1000);
     return true;
 }
 
@@ -987,14 +1029,25 @@ void ESPNowBridge::finalizeRelayCommandExecution(const uint8_t* senderMac, uint3
 
     bool ackSent = espNowController->sendRelayCommandAck(senderMac, ack);
     if (ackSent) {
-        Serial.printf("✅ RELAY_ACK enviado id=%u R%d state=%s\n",
-                      (unsigned)ack.commandId, relayNumber, currentState ? "ON" : "OFF");
+        if (relayNumber == 0xFF) {
+            uint8_t actual = localRelayController ? localRelayController->getRelayMask() : 0;
+            Serial.printf("%s RELAY_ACK MASK id=%u success=%u actual=0x%02X\n",
+                          commandOk ? "✅" : "❌",
+                          (unsigned)ack.commandId,
+                          (unsigned)ack.success,
+                          actual);
+        } else {
+            Serial.printf("%s RELAY_ACK id=%u R%d success=%u state=%s\n",
+                          commandOk ? "✅" : "❌",
+                          (unsigned)ack.commandId, relayNumber,
+                          (unsigned)ack.success,
+                          currentState ? "ON" : "OFF");
+        }
     } else {
         Serial.println("⚠️ Falha ao enviar RELAY_ACK");
     }
 
-    // ALL_RELAYS imediato só após ACK OK; throttle mantido para sync periódico
-    sendAllRelaysStatusToMasterInternal(senderMac, ackSent || forceAllRelays);
+    sendAllRelaysStatusToMasterInternal(senderMac, commandOk || forceAllRelays);
 }
 
 // ===== MÉTODOS PRIVADOS (COMPATIBILIDADE) =====
@@ -1053,42 +1106,73 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
                     #ifdef SLAVE_MODE
                     extern RelayCommandBox relayBox;
                     
-                String action = String(cmdData.action);
+                String action = normalizeRelayAction(cmdData.action, sizeof(cmdData.action));
                 Serial.println("⚡ Executando comando no RelayBox...");
+                Serial.println("   action='" + action + "' dur=" + String(cmdData.duration));
 
                 uint32_t ackCommandId = cmdData.commandId;
                 if (ackCommandId == 0) {
                     ackCommandId = message.messageId;
                 }
                 
-                bool commandOk = true;
-                if (action == "status" || action == "STATUS") {
+                bool commandOk = false;
+                String mode = normalizeRelayAction(cmdData.mode, sizeof(cmdData.mode));
+
+                if (action == "status") {
                     Serial.println("📊 Status solicitado — sync ALL_RELAYS");
-                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, true, true);
-                } else if (action == "on") {
+                    commandOk = relayBox.isOperational();
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, true);
+                } else if (isCycleAction(action, mode)) {
+                    uint32_t onSec = cmdData.duration > 0 ? (uint32_t)cmdData.duration : 1;
+                    uint32_t offSec = cmdData.cycleOffDuration > 0 ? (uint32_t)cmdData.cycleOffDuration : onSec;
+                    commandOk = relayBox.startCycle(cmdData.relayNumber, onSec, offSec);
+                    Serial.println(commandOk ? "✅ CYCLE iniciado" : "❌ CYCLE falhou (ACK fail)");
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
+                } else if (action == "cycle_stop" || mode == "cycle_stop" || action.startsWith("cycle_stop")) {
+                    commandOk = relayBox.stopCycle(cmdData.relayNumber);
+                    Serial.println(commandOk ? "✅ CYCLE parado" : "❌ CYCLE stop falhou");
+                    finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
+                } else if (isTimedOnAction(action)) {
                     if (cmdData.duration > 0) {
-                        relayBox.setRelayWithTimer(cmdData.relayNumber, true, cmdData.duration);
+                        commandOk = relayBox.setRelayWithTimer(cmdData.relayNumber, true, cmdData.duration);
                     } else {
-                        relayBox.setRelay(cmdData.relayNumber, true);
+                        commandOk = relayBox.setRelay(cmdData.relayNumber, true);
                     }
-                    Serial.println("✅ Relé " + String(cmdData.relayNumber) + " LIGADO");
+                    Serial.println(commandOk ? "✅ Relé LIGADO" : "❌ Relé NÃO ligado (ACK fail)");
                     finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
                 } else if (action == "off") {
-                    relayBox.setRelay(cmdData.relayNumber, false);
-                    Serial.println("✅ Relé " + String(cmdData.relayNumber) + " DESLIGADO");
+                    commandOk = relayBox.setRelay(cmdData.relayNumber, false);
+                    Serial.println(commandOk ? "✅ Relé DESLIGADO" : "❌ Relé NÃO desligado (ACK fail)");
                     finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
                 } else if (action == "toggle") {
-                    relayBox.toggleRelay(cmdData.relayNumber);
-                    Serial.println("✅ Relé " + String(cmdData.relayNumber) + " ALTERNADO");
+                    commandOk = relayBox.toggleRelay(cmdData.relayNumber);
+                    Serial.println(commandOk ? "✅ Relé ALTERNADO" : "❌ Relé NÃO alternado (ACK fail)");
                     finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, commandOk, false);
                 } else {
-                    commandOk = false;
                     Serial.println("❌ Ação desconhecida: " + action);
                     finalizeRelayCommandExecution(senderMac, ackCommandId, cmdData.relayNumber, false, false);
                 }
                 #endif
                 }
             }
+            break;
+        }
+
+        case MessageType::SET_RELAY_MASK: {
+#ifdef SLAVE_MODE
+            if (message.dataSize >= sizeof(RelayMaskCommandData)) {
+                RelayMaskCommandData maskCmd;
+                memcpy(&maskCmd, message.data, sizeof(RelayMaskCommandData));
+                Serial.printf("[PROC] SET_RELAY_MASK 0x%02X id=%u dur=%u\n",
+                              maskCmd.mask, (unsigned)maskCmd.commandId, (unsigned)maskCmd.durationSec);
+                extern RelayCommandBox relayBox;
+                uint32_t ackId = maskCmd.commandId ? maskCmd.commandId : message.messageId;
+                bool ok = relayBox.applyRelayMask(maskCmd.mask, maskCmd.durationSec);
+                finalizeRelayCommandExecution(senderMac, ackId, 0xFF, ok, true);
+            } else {
+                Serial.println("❌ SET_RELAY_MASK payload curto");
+            }
+#endif
             break;
         }
         
@@ -1271,9 +1355,9 @@ bool ESPNowBridge::validateMessage(const ESPNowMessage& message) {
     // Se precisar validar, use um sistema de sincronização de tempo (NTP)
     
     // ✅ Verificar tipo de mensagem válido (atualizado para incluir novos tipos)
-    if (message.type > MessageType::CONNECTIVITY_REPORT) {  // 0x0D = último tipo válido
+    if (message.type > MessageType::SET_RELAY_MASK) {
         Serial.println("❌ Tipo de mensagem inválido: " + String((int)message.type));
-        Serial.println("💡 Tipos válidos: 0x01 a 0x0D");
+        Serial.println("💡 Tipos válidos: 0x01 a 0x10");
         Serial.println("💡 Tipo recebido: 0x" + String((int)message.type, HEX));
         return false;
     }
@@ -1379,6 +1463,8 @@ void ESPNowBridge::onDataReceived(const uint8_t* mac, const uint8_t* incomingDat
         case MessageType::HANDSHAKE_RESPONSE: msgType = "HANDSHAKE RESPONSE"; break;
         case MessageType::CONNECTIVITY_CHECK: msgType = "CONNECTIVITY CHECK"; break;
         case MessageType::CONNECTIVITY_REPORT: msgType = "CONNECTIVITY REPORT"; break;
+        case MessageType::ALL_RELAYS_STATUS: msgType = "ALL_RELAYS_STATUS"; break;
+        case MessageType::SET_RELAY_MASK: msgType = "SET_RELAY_MASK"; break;
         default: msgType = "DESCONHECIDO (0x" + String((int)message.type, HEX) + ")"; break;
     }
     Serial.println("📨 Tipo: " + msgType);

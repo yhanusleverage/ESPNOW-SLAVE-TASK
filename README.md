@@ -193,21 +193,51 @@ discovery.clearCache();
 SafetyWatchdog watchdog;
 watchdog.begin();
 
-// Alimentar watchdog (no loop)
+watchdog.setSafetyModeCallback([]() {
+    relayBox.turnOffAllRelays();      // imediato
+    relayBox.setSafetyModeBlocked(true);
+});
+
+watchdog.setRecoveryHandler([](uint8_t level) -> bool {
+    // L1: re-ping, L2: re-discovery, L3: ESP-NOW reinit, L4: esp_restart()
+    return false;
+});
+
+// Alimentar watchdog (no loop) — inclui pulso GPIO watchdog externo
 watchdog.feed();
-
-// Verificar saúde do Master
 watchdog.checkMasterHealth();
+watchdog.updateRecovery();            // recovery L1-L4 + reboot após 10 min SafetyMode
 
-// Responder ao Master
-watchdog.onMasterResponse();
+watchdog.onMasterResponse();          // PONG do Master
 
-// Verificações
 if (watchdog.isSafetyMode()) {
-    // Master offline - modo seguro ativo
-    relayBox.turnOffAllRelays();
+    // Relés já desligados; novos ON bloqueados
 }
 ```
+
+**Comandos serial:** `watchdog_status`, `system_health`, `watchdog_reset`
+
+**Limites por relé:** `RELAY_CONFIGS` em `DataTypes.h` — `maxDuration` e `safetyLock` aplicados em `RelayCommandBox`.
+
+### 🔌 Relé Watchdog Externo (produção agro)
+
+Para bombas críticas, use um **relé watchdog externo** alimentado por pulso GPIO do ESP32. Se o firmware travar e o pulso parar, o relé externo corta a alimentação das bombas (fail-safe elétrico).
+
+| Parâmetro | Default | Descrição |
+|-----------|---------|-----------|
+| `HW_WATCHDOG_ENABLED` | `1` | Ativa pulso GPIO |
+| `HW_WATCHDOG_GPIO` | `26` | Pino de pulso (5 s toggle) |
+| `HW_WATCHDOG_PULSE_INTERVAL_MS` | `5000` | Intervalo do pulso |
+
+**Ligação típica:**
+```
+ESP32 GPIO26 ──► Relé watchdog externo (entrada pulse)
+                     └── contatos NC em série com bombas críticas
+```
+
+Desative com `HW_WATCHDOG_ENABLED 0` em `Config.h` se não usar hardware externo.
+
+**Referências de prática agro:** ISO 25119 (SRP/CS), IEC 61508 — fail-safe eléctrico + supervisión de comunicación.
 
 ### 🔌 RelayCommandBox
 

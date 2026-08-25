@@ -45,28 +45,28 @@ struct RelayConfig {
     }
 };
 
-// Nomes dos relés para 8 relés (Sistema Master ESP-NOW)
+// Identidade no Atlas: só índice. Nomes de produto vivem no Master/UI (relay_slaves.relay_names).
 static const char* const RELAY_NAMES[MAX_RELAYS] = {
-    "Bomba Principal",
-    "Luzes LED", 
-    "Ventilador",
-    "Aquecedor",
-    "Solenoide 1",
-    "Solenoide 2", 
-    "Alarme",
-    "Reserva"
+    "Relé 0",
+    "Relé 1",
+    "Relé 2",
+    "Relé 3",
+    "Relé 4",
+    "Relé 5",
+    "Relé 6",
+    "Relé 7"
 };
 
 // Configurações padrão dos relés para 8 relés
 static const RelayConfig RELAY_CONFIGS[MAX_RELAYS] = {
-    {true, 3600, true},   // Bomba Principal: 1h max, com trava
-    {true, 43200, false}, // Luzes LED: 12h max, sem trava
-    {true, 7200, false},  // Ventilador: 2h max, sem trava
-    {true, 3600, true},   // Aquecedor: 1h max, com trava
-    {true, 300, true},    // Solenoide 1: 5min max, com trava
-    {true, 300, true},    // Solenoide 2: 5min max, com trava
-    {true, 60, false},    // Alarme: 1min max, sem trava
-    {true, 3600, true}    // Reserva: 1h max, com trava
+    {true, 3600, true},
+    {true, 43200, false},
+    {true, 7200, false},
+    {true, 3600, true},
+    {true, 300, true},
+    {true, 300, true},
+    {true, 60, false},
+    {true, 3600, true}
 };
 
 // Verificações em tempo de compilação
@@ -124,8 +124,12 @@ struct RelayState {
     unsigned long startTime = 0;
     int timerSeconds = 0;
     bool hasTimer = false;
-    String name = "";  // Nome do relé
-    RelayConfig config;  // Incorporar configuração
+    String name = "";
+    RelayConfig config;
+    bool inCycle = false;
+    bool cyclePhaseOn = true;
+    uint32_t cycleOnSec = 0;
+    uint32_t cycleOffSec = 0;
 };
 
 #endif // DATA_TYPES_H 

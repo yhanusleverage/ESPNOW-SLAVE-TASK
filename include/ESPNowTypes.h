@@ -108,11 +108,14 @@ struct AllRelaysStatus {
  * Permite recuperação após reinicio ou queda de energia
  */
 struct PersistentRelayState {
-    uint8_t state;            // 0=OFF, 1=ON
-    uint8_t hasTimer;         // 1=tem timer ativo, 0=sem timer
-    uint32_t timerEndTime;    // Timestamp quando timer expira (0 se sem timer)
-    uint8_t isPersistent;     // 1=estado persistente (on_forever), 0=temporário
-    uint8_t padding[3];       // Padding para alinhamento
+    uint8_t state;
+    uint8_t hasTimer;
+    uint32_t timerEndTime;    // segundos restantes da fase actual
+    uint8_t isPersistent;
+    uint8_t inCycle;
+    uint8_t cyclePhaseOn;
+    uint16_t cycleOnSec;
+    uint16_t cycleOffSec;
 } __attribute__((packed));
 
 /**
@@ -123,7 +126,7 @@ struct PersistentRelayState {
 struct PersistentRelayStateData {
     uint32_t timestamp;              // Timestamp da última atualização
     uint8_t numRelays;               // Número total de relés (geralmente 8)
-    uint8_t version;                 // Versão do formato (1 = inicial)
+    uint8_t version;                 // 2 = cycle + remainingSec
     uint8_t padding[2];              // Padding para alinhamento
     PersistentRelayState relays[8];  // Estado de cada relé (0-7)
     uint8_t checksum;                // Checksum para validação

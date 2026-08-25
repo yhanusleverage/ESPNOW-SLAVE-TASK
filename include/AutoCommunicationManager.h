@@ -17,6 +17,7 @@
 
 #include <Arduino.h>
 #include <vector>
+#include <functional>
 #include <Preferences.h>
 #include "ESPNowController.h"
 #include "WiFiCredentialsManager.h"
@@ -188,8 +189,13 @@ private:
     // Counters
     uint8_t credentialRetries;
     uint8_t recoveryLevel;
+    bool healthMonitoringEnabled = true;
     
-    // Métricas por dispositivo
+    // Recovery delegates (usados quando health monitoring ativo)
+    std::function<bool()> softRecoveryDelegate = nullptr;
+    std::function<bool()> mediumRecoveryDelegate = nullptr;
+    std::function<bool()> hardRecoveryDelegate = nullptr;
+    std::function<bool()> fullRecoveryDelegate = nullptr;
     std::vector<ConnectionMetrics> deviceMetrics;
     
     // Callbacks
@@ -280,11 +286,31 @@ public:
                 break;
         }
         
-        // Verificação de saúde periódica
-        if (now - lastHealthCheck > HEALTH_CHECK_INTERVAL) {
+        // Verificação de saúde periódica (desativada no SLAVE — SafetyWatchdog orquestra)
+        if (healthMonitoringEnabled && now - lastHealthCheck > HEALTH_CHECK_INTERVAL) {
             performHealthCheck();
             lastHealthCheck = now;
         }
+    }
+    
+    /**
+     * @brief Ativa/desativa monitoramento de saúde interno
+     * No SLAVE, usar false — SafetyWatchdog é a fonte única de health/recovery
+     */
+    void setHealthMonitoringEnabled(bool enabled) {
+        healthMonitoringEnabled = enabled;
+        Serial.println("🤖 Health monitoring interno: " + String(enabled ? "ATIVO" : "DESATIVADO (SafetyWatchdog)"));
+    }
+
+    void setRecoveryDelegates(
+        std::function<bool()> soft,
+        std::function<bool()> medium,
+        std::function<bool()> hard,
+        std::function<bool()> full) {
+        softRecoveryDelegate = soft;
+        mediumRecoveryDelegate = medium;
+        hardRecoveryDelegate = hard;
+        fullRecoveryDelegate = full;
     }
     
     /**
@@ -492,6 +518,8 @@ private:
     }
     
     void handleMonitoring(unsigned long now) {
+        if (!healthMonitoringEnabled) return;
+
         // Enviar heartbeat periódico (Master)
         if (isMaster && now - lastHeartbeat > MASTER_HEARTBEAT_INTERVAL) {
             sendHeartbeat();
@@ -502,7 +530,7 @@ private:
         for (auto& metrics : deviceMetrics) {
             if (now - metrics.lastPongReceived > MASTER_HEARTBEAT_TIMEOUT) {
                 Serial.println("⚠️ Heartbeat timeout detectado!");
-                initiateRecovery(1); // Soft recovery
+                initiateRecovery(1);
                 return;
             }
         }
@@ -614,6 +642,8 @@ private:
     }
     
     void performHealthCheck() {
+        if (!healthMonitoringEnabled) return;
+
         for (auto& metrics : deviceMetrics) {
             metrics.calculateHealthScore();
             
@@ -639,13 +669,21 @@ private:
     }
     
     bool attemptSoftRecovery() {
-        Serial.println("🔧 Soft Recovery: Reenviando última mensagem...");
-        // Implementar
-        return false; // Temporário
+        Serial.println("🔧 Soft Recovery: Re-ping + broadcast...");
+        if (softRecoveryDelegate) return softRecoveryDelegate();
+        auto peers = espNowController->getPeerList();
+        for (const auto& peer : peers) {
+            if (peer.online) {
+                espNowController->sendPing(peer.macAddress);
+            }
+        }
+        espNowController->sendDiscoveryBroadcast();
+        return false;
     }
     
     bool attemptMediumRecovery() {
         Serial.println("🔧 Medium Recovery: Re-discovery...");
+        if (mediumRecoveryDelegate) return mediumRecoveryDelegate();
         espNowController->sendDiscoveryBroadcast();
         delay(2000);
         return espNowController->getPeerCount() > 0;
@@ -653,15 +691,18 @@ private:
     
     bool attemptHardRecovery() {
         Serial.println("🔧 Hard Recovery: Reinicializando ESP-NOW...");
+        if (hardRecoveryDelegate) return hardRecoveryDelegate();
         espNowController->end();
         delay(500);
         return espNowController->begin();
     }
     
     bool attemptFullRecovery() {
-        Serial.println("🔧 Full Recovery: Reconectando WiFi + ESP-NOW...");
-        // Implementar reconexão completa
-        return false; // Temporário
+        Serial.println("🔧 Full Recovery: Reiniciando sistema...");
+        if (fullRecoveryDelegate) return fullRecoveryDelegate();
+        delay(100);
+        esp_restart();
+        return true;
     }
 };
 

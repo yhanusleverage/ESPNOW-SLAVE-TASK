@@ -275,7 +275,7 @@ public:
      * @param sessionId ID da sessão
      * @return true se relatório foi enviado
      */
-    bool sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId);
+    bool sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId, int operationalOverride = -1);
     
     /**
      * @brief Gera ID único de sessão

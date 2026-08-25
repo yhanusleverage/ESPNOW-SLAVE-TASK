@@ -35,7 +35,8 @@ enum class MessageType : uint8_t {
     HANDSHAKE_RESPONSE = 0x0B,  // Resposta ao handshake
     CONNECTIVITY_CHECK = 0x0C,  // Verificação de conectividade
     CONNECTIVITY_REPORT = 0x0D, // Relatório de conectividade
-    ALL_RELAYS_STATUS = 0x0E    // 🔄 FASE 3: Estado de todos os relays
+    ALL_RELAYS_STATUS = 0x0E,   // Slave → Master: estado real dos 8 relés
+    SET_RELAY_MASK = 0x0F       // Master → slave: máscara 8 bits atómica (bit i = relé i, 1 = ON)
 };
 
 /**
@@ -53,8 +54,17 @@ struct ESPNowMessage {
 } __attribute__((packed));
 
 /**
- * @brief Estrutura para comando de relé
+ * Master → slave: um acto = 1 pacote.
+ * mask bit i = relé i (1 = ON). PCF activo em LOW → write8(~mask).
+ * durationSec 0 = permanente (maxDuration do relé ainda aplica no slave).
  */
+struct RelayMaskCommandData {
+    uint8_t mask;
+    uint8_t pad;
+    uint16_t durationSec;
+    uint32_t commandId;
+} __attribute__((packed));
+
 struct RelayCommandData {
     int relayNumber;           // Número do relé (0-7)
     bool state;               // Estado desejado
@@ -433,7 +443,7 @@ public:
      * @param sessionId ID da sessão
      * @return true se relatório foi enviado
      */
-    bool sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId);
+    bool sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId, int operationalOverride = -1);
     
     /**
      * @brief Solicita verificação de conectividade

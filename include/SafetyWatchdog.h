@@ -3,92 +3,138 @@
 
 #include <Arduino.h>
 #include <esp_task_wdt.h>
+#include <functional>
+#include "Config.h"
 
 /**
  * @brief Sistema de Watchdog de Segurança para Automação Hidropônica
- * 
- * Características:
- * - Hardware Watchdog (reinicia ESP32 se travado)
- * - Heartbeat bidirecional Master ↔ Slave
- * - Modo seguro automático (desliga bombas se Master offline)
- * - Monitoramento de WiFi
- * - Simples e eficaz para aplicações críticas
+ *
+ * - Hardware Task WDT (reinicia ESP32 se travado)
+ * - Heartbeat Master ↔ Slave
+ * - Modo seguro imediato (desliga relés)
+ * - Recovery escalonado L1-L4
+ * - Reboot automático após SafetyMode prolongado
+ * - Pulso GPIO opcional para relé watchdog externo
  */
 class SafetyWatchdog {
+public:
+    using SafetyModeCallback = std::function<void()>;
+    using RecoveryHandler = std::function<bool(uint8_t level)>;
+
 private:
     unsigned long lastMasterPing = 0;
     unsigned long lastWiFiCheck = 0;
     unsigned long lastHeartbeatSent = 0;
+    unsigned long safetyModeActivatedAt = 0;
+    unsigned long lastExternalPulse = 0;
+    unsigned long lastRecoveryAttempt = 0;
+
     bool masterOnline = false;
     bool safetyModeActive = false;
     int consecutiveFailures = 0;
-    
-    // Configuração conservadora para hidroponia
-    const unsigned long HEARTBEAT_INTERVAL = 15000;  // Enviar ping a cada 15s
-    const unsigned long MASTER_TIMEOUT = 45000;      // Master offline após 45s
-    const unsigned long WIFI_CHECK_INTERVAL = 30000; // Verificar WiFi a cada 30s
-    const unsigned long RECONNECT_COOLDOWN = 10000;  // Tentar reconectar a cada 10s
-    const int MAX_CONSECUTIVE_FAILURES = 3;          // Máximo de falhas antes de modo seguro
-    
+    uint8_t recoveryLevel = 0;
+    uint8_t lastRecoveryLevelAttempted = 0;
+
+    SafetyModeCallback safetyModeCallback = nullptr;
+    RecoveryHandler recoveryHandler = nullptr;
+
+    const unsigned long HEARTBEAT_INTERVAL = 15000;
+    const unsigned long MASTER_TIMEOUT = 45000;
+    const unsigned long WIFI_CHECK_INTERVAL = 30000;
+    const int MAX_CONSECUTIVE_FAILURES = 3;
+
+    static const unsigned long SOFT_RECOVERY_DELAY = 5000;
+    static const unsigned long MEDIUM_RECOVERY_DELAY = 20000;
+    static const unsigned long HARD_RECOVERY_DELAY = 50000;
+    static const unsigned long FULL_RECOVERY_DELAY = 110000;
+    static const unsigned long SAFETY_MODE_REBOOT_TIMEOUT = 600000; // 10 min
+
+#if defined(HW_WATCHDOG_ENABLED) && HW_WATCHDOG_ENABLED
+    static const unsigned long EXTERNAL_PULSE_INTERVAL = HW_WATCHDOG_PULSE_INTERVAL_MS;
+#else
+    static const unsigned long EXTERNAL_PULSE_INTERVAL = 5000;
+#endif
+
+    bool externalWatchdogLevel = false;
+
+    void pulseExternalWatchdog() {
+#if defined(HW_WATCHDOG_ENABLED) && HW_WATCHDOG_ENABLED
+        if (millis() - lastExternalPulse >= EXTERNAL_PULSE_INTERVAL) {
+            externalWatchdogLevel = !externalWatchdogLevel;
+            digitalWrite(HW_WATCHDOG_GPIO, externalWatchdogLevel ? HIGH : LOW);
+            lastExternalPulse = millis();
+        }
+#endif
+    }
+
+    void resetRecoveryState() {
+        recoveryLevel = 0;
+        lastRecoveryLevelAttempted = 0;
+        lastRecoveryAttempt = 0;
+        safetyModeActivatedAt = 0;
+    }
+
 public:
-    /**
-     * @brief Inicializa o watchdog de segurança
-     */
     void begin() {
-        // Inicializar Hardware Watchdog do ESP32 (60 segundos timeout)
         esp_task_wdt_init(60, true);
         esp_task_wdt_add(NULL);
-        
+
+#if defined(HW_WATCHDOG_ENABLED) && HW_WATCHDOG_ENABLED
+        pinMode(HW_WATCHDOG_GPIO, OUTPUT);
+        digitalWrite(HW_WATCHDOG_GPIO, LOW);
+        Serial.println("   HW Watchdog GPIO: " + String(HW_WATCHDOG_GPIO));
+#endif
+
         lastMasterPing = millis();
         lastWiFiCheck = millis();
         lastHeartbeatSent = millis();
-        
+
         Serial.println("✅ SafetyWatchdog inicializado");
-        Serial.println("   Heartbeat: " + String(HEARTBEAT_INTERVAL/1000) + "s");
-        Serial.println("   Timeout Master: " + String(MASTER_TIMEOUT/1000) + "s");
+        Serial.println("   Heartbeat: " + String(HEARTBEAT_INTERVAL / 1000) + "s");
+        Serial.println("   Timeout Master: " + String(MASTER_TIMEOUT / 1000) + "s");
         Serial.println("   Hardware WDT: 60s");
+        Serial.println("   SafetyMode reboot: " + String(SAFETY_MODE_REBOOT_TIMEOUT / 60000) + " min");
     }
-    
-    /**
-     * @brief Alimenta o watchdog de hardware (DEVE ser chamado no loop)
-     */
+
+    void setSafetyModeCallback(SafetyModeCallback callback) {
+        safetyModeCallback = callback;
+    }
+
+    void setRecoveryHandler(RecoveryHandler handler) {
+        recoveryHandler = handler;
+    }
+
     void feed() {
         esp_task_wdt_reset();
+        pulseExternalWatchdog();
     }
-    
-    /**
-     * @brief Registra resposta do Master (chamar quando receber PONG)
-     */
+
     void onMasterResponse() {
         lastMasterPing = millis();
         consecutiveFailures = 0;
-        
+
         if (!masterOnline) {
             Serial.println("✅ Master reconectado!");
             masterOnline = true;
         }
-        
-        // Sair do modo seguro se estava ativo
+
         if (safetyModeActive) {
             Serial.println("✅ Saindo do modo seguro");
             safetyModeActive = false;
+            resetRecoveryState();
         }
     }
-    
-    /**
-     * @brief Verifica saúde do Master
-     * @return true se Master está online
-     */
+
     bool checkMasterHealth() {
         unsigned long timeSinceLastPing = millis() - lastMasterPing;
-        
+
         if (timeSinceLastPing > MASTER_TIMEOUT) {
             if (masterOnline) {
                 consecutiveFailures++;
-                Serial.println("⚠️ MASTER NÃO RESPONDE! (" + String(consecutiveFailures) + "/" + 
-                              String(MAX_CONSECUTIVE_FAILURES) + ")");
-                Serial.println("   Tempo sem resposta: " + String(timeSinceLastPing/1000) + "s");
-                
+                Serial.println("⚠️ MASTER NÃO RESPONDE! (" + String(consecutiveFailures) + "/" +
+                               String(MAX_CONSECUTIVE_FAILURES) + ")");
+                Serial.println("   Tempo sem resposta: " + String(timeSinceLastPing / 1000) + "s");
+
                 if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                     Serial.println("🚨 MASTER OFFLINE CONFIRMADO!");
                     masterOnline = false;
@@ -97,43 +143,76 @@ public:
             }
             return false;
         }
-        
+
         return true;
     }
-    
-    /**
-     * @brief Ativa modo de segurança (CRÍTICO para hidroponia)
-     */
+
     void activateSafetyMode() {
         if (!safetyModeActive) {
             safetyModeActive = true;
+            safetyModeActivatedAt = millis();
+            recoveryLevel = 0;
+            lastRecoveryLevelAttempted = 0;
+            lastRecoveryAttempt = 0;
+
             Serial.println("\n🚨 =============================");
             Serial.println("🚨 MODO SEGURO ATIVADO");
             Serial.println("🚨 =============================");
             Serial.println("   Master offline detectado");
-            Serial.println("   Bombas serão desligadas por segurança");
-            Serial.println("   Sistema aguardando reconexão...");
+            Serial.println("   Relés desligados imediatamente");
+            Serial.println("   Recovery automático iniciado");
             Serial.println("=============================\n");
+
+            if (safetyModeCallback) {
+                safetyModeCallback();
+            }
         }
     }
-    
-    /**
-     * @brief Verifica se está em modo seguro
-     */
-    bool isSafetyMode() {
-        return safetyModeActive;
+
+    void updateRecovery() {
+        if (!safetyModeActive) return;
+
+        unsigned long sinceSafety = millis() - safetyModeActivatedAt;
+
+        if (sinceSafety >= SAFETY_MODE_REBOOT_TIMEOUT) {
+            Serial.println("🔄 SafetyMode > 10 min — reiniciando sistema...");
+            forceReset();
+            return;
+        }
+
+        if (!recoveryHandler) return;
+
+        uint8_t targetLevel = 0;
+        if (sinceSafety >= FULL_RECOVERY_DELAY) targetLevel = 4;
+        else if (sinceSafety >= HARD_RECOVERY_DELAY) targetLevel = 3;
+        else if (sinceSafety >= MEDIUM_RECOVERY_DELAY) targetLevel = 2;
+        else if (sinceSafety >= SOFT_RECOVERY_DELAY) targetLevel = 1;
+
+        if (targetLevel == 0 || targetLevel <= lastRecoveryLevelAttempted) return;
+
+        if (millis() - lastRecoveryAttempt < 3000) return;
+
+        lastRecoveryAttempt = millis();
+        lastRecoveryLevelAttempted = targetLevel;
+        recoveryLevel = targetLevel;
+
+        Serial.printf("🔄 Recovery L%d (SafetyMode há %lus)...\n", targetLevel, sinceSafety / 1000);
+
+        if (recoveryHandler(targetLevel)) {
+            Serial.printf("✅ Recovery L%d bem-sucedido\n", targetLevel);
+            if (targetLevel >= 4) return;
+            recoveryLevel = 0;
+            lastRecoveryLevelAttempted = 0;
+        }
     }
-    
-    /**
-     * @brief Verifica se Master está online
-     */
-    bool isMasterOnline() {
-        return masterOnline;
+
+    bool isSafetyMode() const { return safetyModeActive; }
+    bool isMasterOnline() const { return masterOnline; }
+    uint8_t getRecoveryLevel() const { return recoveryLevel; }
+    unsigned long getSafetyModeDuration() const {
+        return safetyModeActive ? (millis() - safetyModeActivatedAt) : 0;
     }
-    
-    /**
-     * @brief Verifica se deve enviar heartbeat
-     */
+
     bool shouldSendHeartbeat() {
         if (millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL) {
             lastHeartbeatSent = millis();
@@ -141,10 +220,7 @@ public:
         }
         return false;
     }
-    
-    /**
-     * @brief Verifica se deve checar WiFi
-     */
+
     bool shouldCheckWiFi() {
         if (millis() - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
             lastWiFiCheck = millis();
@@ -152,48 +228,40 @@ public:
         }
         return false;
     }
-    
-    /**
-     * @brief Obtém tempo desde última resposta do Master
-     */
-    unsigned long getTimeSinceLastResponse() {
+
+    unsigned long getTimeSinceLastResponse() const {
         return millis() - lastMasterPing;
     }
-    
-    /**
-     * @brief Força reset do watchdog (usar com cuidado)
-     */
+
     void forceReset() {
         Serial.println("🔄 Forçando reset do sistema...");
         delay(100);
         esp_restart();
     }
-    
-    /**
-     * @brief Imprime status do watchdog
-     */
+
     void printStatus() {
         Serial.println("\n🛡️ === STATUS SAFETY WATCHDOG ===");
         Serial.println("   Master: " + String(masterOnline ? "🟢 Online" : "🔴 Offline"));
         Serial.println("   Modo Seguro: " + String(safetyModeActive ? "🔴 ATIVO" : "🟢 Normal"));
-        Serial.println("   Última resposta: " + String((millis() - lastMasterPing)/1000) + "s atrás");
+        if (safetyModeActive) {
+            Serial.println("   SafetyMode há: " + String(getSafetyModeDuration() / 1000) + "s");
+        }
+        Serial.println("   Última resposta: " + String(getTimeSinceLastResponse() / 1000) + "s atrás");
         Serial.println("   Falhas consecutivas: " + String(consecutiveFailures) + "/" + String(MAX_CONSECUTIVE_FAILURES));
-        Serial.println("   Uptime: " + String(millis()/1000) + "s");
+        Serial.println("   Recovery level: " + String(recoveryLevel));
+        Serial.println("   Uptime: " + String(millis() / 1000) + "s");
         Serial.println("   Heap livre: " + String(ESP.getFreeHeap()) + " bytes");
         Serial.println("==================================\n");
     }
-    
-    /**
-     * @brief Reseta contadores (útil após reconexão manual)
-     */
+
     void reset() {
         lastMasterPing = millis();
         consecutiveFailures = 0;
         masterOnline = true;
         safetyModeActive = false;
+        resetRecoveryState();
         Serial.println("✅ SafetyWatchdog resetado");
     }
 };
 
 #endif // SAFETY_WATCHDOG_H
-

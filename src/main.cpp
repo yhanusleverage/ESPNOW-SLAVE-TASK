@@ -10,6 +10,7 @@
 #include "SafetyWatchdog.h"
 #include "AutoCommunicationManager.h"  // 🧠 PILAR INTELIGENTE
 #include "MultiChannelDiscovery.h"  // 🔍 DISCOVERY AUTOMÁTICO MULTI-CANAL
+#include "SystemHealth.h"
 
 // ✅ CORREÇÃO BUG #4: Include para MasterSlaveManager
 #ifdef MASTER_MODE
@@ -73,9 +74,10 @@ void setupCallbacks();
     unsigned long lastReconnectionAttempt = 0;
     unsigned long lastSignalCheck = 0;
     int failedPingCount = 0;
-    int maxFailedPings = 3;
+    int maxFailedPings = 8;
     bool masterConnected = false;
     bool channelSyncCompleted = false;  // Flag para indicar se canal já foi sincronizado
+    unsigned long lastMasterRxMs = 0;
     
     // Protótipos de função para Slave
     uint8_t detectMasterChannel();
@@ -97,8 +99,8 @@ void setupCallbacks();
     void performRediscoveryIfNeeded();
     void linkMcdToEspNowBridge();
 
-    /** Alinhado com master SLAVE_REACHABLE_MS (45s) */
-    static constexpr unsigned long SLAVE_REDISCOVERY_INITIAL_MS = 45000;
+    /** Alinhado com master SLAVE_REACHABLE_MS (120s): esperar antes de scan */
+    static constexpr unsigned long SLAVE_REDISCOVERY_INITIAL_MS = 180000;
 
     static bool mcdSendBroadcastDelegate();
     static bool mcdChannelSyncDelegate(uint8_t ch);
@@ -224,6 +226,8 @@ void setup() {
 #elif defined(SLAVE_MODE)
     Serial.println("🚀 Iniciando ESP-NOW Slave (Multi-Channel Discovery)");
     Serial.println("===================================================");
+
+    SystemHealth::logBootInfo();
     
     // 1. Cache NVS (sem esp_now — ESPNowController é o único dono)
     Serial.println("\n📡 FASE 1: Cache de canal NVS...");
@@ -293,26 +297,59 @@ void setup() {
     }
     Serial.printf("🔒 Boot canal fixo %u — MCD locked, scan 1-13 desativado\n", masterChannel);
 #else
-    if (multiChannelDiscovery) {
-        ChannelCache bootCache = multiChannelDiscovery->getCache();
-        if (bootCache.lastChannel >= 1 && bootCache.lastChannel <= 13 &&
-            bootCache.successRate >= 50) {
-            multiChannelDiscovery->lockMasterChannel(true);
-            if (espNowBridge->getESPNowController()) {
-                espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
-            }
-            Serial.printf("🔒 Boot: cache confiável canal %u — scan completo adiado\n", masterChannel);
-        }
-    }
+    Serial.println("📡 ESPNOW_FIXED_CHANNEL_ENABLED=0 — scan 1-13 até lock NVS");
+    Serial.println("   Cache NVS só para escuta inicial; lock após Master responder");
 #endif
     
     // 4. SafetyWatchdog
     Serial.println("\n🛡️ FASE 4: Inicializando SafetyWatchdog...");
     watchdog.begin();
+
+    watchdog.setSafetyModeCallback([]() {
+        relayBox.turnOffAllRelays();
+        relayBox.setSafetyModeBlocked(true);
+    });
+
+    watchdog.setRecoveryHandler([](uint8_t level) -> bool {
+        switch (level) {
+            case 1:
+                if (espNowBridge) {
+                    espNowBridge->ensureBroadcastPeer();
+                    auto peers = espNowBridge->getPeerList();
+                    if (!peers.empty()) {
+                        espNowBridge->sendPing(peers[0].macAddress);
+                    } else {
+                        espNowBridge->sendDiscoveryBroadcast();
+                    }
+                }
+                return false;
+            case 2:
+                if (multiChannelDiscovery) {
+                    return multiChannelDiscovery->rediscoverMaster(true) == DiscoveryResult::SUCCESS;
+                }
+                return false;
+            case 3:
+                if (espNowBridge && espNowBridge->getESPNowController()) {
+                    auto* ctrl = espNowBridge->getESPNowController();
+                    ctrl->end();
+                    delay(500);
+                    return ctrl->begin();
+                }
+                return false;
+            case 4:
+                watchdog.forceReset();
+                return true;
+            default:
+                return false;
+        }
+    });
     
     // Configurar callback para recebimento de PONG do Master
     espNowBridge->setPingCallback([](const uint8_t* senderMac) {
+        (void)senderMac;
+        lastMasterRxMs = millis();
         watchdog.onMasterResponse();
+        relayBox.setSafetyModeBlocked(false);
     });
     Serial.println("✅ SafetyWatchdog configurado");
     Serial.println();
@@ -325,11 +362,11 @@ void setup() {
     if (controller) {
         autoComm = new AutoCommunicationManager(controller, &wifiManager, false); // false = SLAVE
         if (autoComm->begin()) {
+            autoComm->setHealthMonitoringEnabled(false);
             Serial.println("✅ Sistema Inteligente ATIVO!");
             Serial.println("   ✓ Auto-Discovery: 30s");
             Serial.println("   ✓ Auto-Response: Imediato");
-            Serial.println("   ✓ Health Check: 10s");
-            Serial.println("   ✓ Auto-Recovery: 4 níveis");
+            Serial.println("   ✓ Health/Recovery: SafetyWatchdog (orquestrador único)");
         } else {
             Serial.println("⚠️ Sistema Inteligente não inicializado");
         }
@@ -344,6 +381,19 @@ void setup() {
     Serial.println("🔌 Relés disponíveis: 0-7");
     Serial.println("💡 Digite 'help' para ver comandos disponíveis");
     Serial.println("📝 Aguardando comandos...");
+
+#if !ESPNOW_FIXED_CHANNEL_ENABLED
+    if (multiChannelDiscovery) {
+        Serial.println("🔍 Discovery inicial (NVS, depois scan 1-13 se preciso)...");
+        DiscoveryResult bootScan = multiChannelDiscovery->discoverMaster();
+        if (bootScan == DiscoveryResult::SUCCESS) {
+            Serial.println("✅ Master no boot, canal " +
+                           String(multiChannelDiscovery->getCurrentChannel()));
+        } else {
+            Serial.println("⏳ Master não no boot — loop tentará de novo");
+        }
+    }
+#endif
     
     // 🔍 DEBUG: Mostrar informações de canal
     Serial.println("\n🔍 === DEBUG: INFORMAÇÕES DE CANAL ===");
@@ -398,19 +448,36 @@ void loop() {
         autoComm->update();  // ✨ CÉREBRO da comunicação
     }
     
-    // 1. Alimentar watchdog de hardware (CRÍTICO - sempre primeiro)
+    // 1. Alimentar watchdog de hardware + pulso GPIO externo
     watchdog.feed();
     
     // 2. Verificar saúde do Master
     watchdog.checkMasterHealth();
+
+    // 3. Recovery escalonado quando em SafetyMode
+    watchdog.updateRecovery();
+
+    relayBox.setSafetyModeBlocked(watchdog.isSafetyMode());
     
-    // 3. Enviar heartbeat se necessário
+    // 4. Enviar heartbeat se necessário
     if (watchdog.shouldSendHeartbeat()) {
         if (espNowBridge && espNowBridge->isInitialized()) {
             auto peers = espNowBridge->getPeerList();
             if (!peers.empty()) {
                 espNowBridge->sendPing(peers[0].macAddress);
             }
+        }
+    }
+
+    // 4.1 Telemetría periódica: ALL_RELAYS actual (desired vive no Master)
+    static unsigned long lastRelayTelemetryMs = 0;
+    const unsigned long RELAY_TELEMETRY_MS = 20000;
+    if (espNowBridge && espNowBridge->isInitialized() &&
+        (millis() - lastRelayTelemetryMs >= RELAY_TELEMETRY_MS)) {
+        lastRelayTelemetryMs = millis();
+        auto peers = espNowBridge->getPeerList();
+        if (!peers.empty()) {
+            espNowBridge->sendAllRelaysStatusToMaster(peers[0].macAddress, false);
         }
     }
     
@@ -427,12 +494,12 @@ void loop() {
         }
     }
     
-    // 5. MODO SEGURO: Desligar todas as bombas se Master offline
+    // 5. MODO SEGURO: aviso periódico (relés já desligados imediatamente)
     if (watchdog.isSafetyMode()) {
         static unsigned long lastSafetyWarning = 0;
-        if (millis() - lastSafetyWarning > 30000) { // Aviso a cada 30s
-            Serial.println("🚨 MODO SEGURO ATIVO - Relés desligados");
-            relayBox.turnOffAllRelays();
+        if (millis() - lastSafetyWarning > 30000) {
+            Serial.println("🚨 MODO SEGURO ATIVO — aguardando Master (" +
+                           String(watchdog.getSafetyModeDuration() / 1000) + "s)");
             lastSafetyWarning = millis();
         }
     }
@@ -1277,8 +1344,33 @@ void handleSerialCommands() {
         else if (command == "watchdog_status") {
             watchdog.printStatus();
         }
+        else if (command == "system_health") {
+            SystemHealth::printStatus(
+                millis(),
+                watchdog.isSafetyMode(),
+                watchdog.isMasterOnline(),
+                watchdog.getTimeSinceLastResponse() / 1000,
+                ESP.getFreeHeap(),
+                watchdog.getRecoveryLevel()
+            );
+            watchdog.printStatus();
+        }
         else if (command == "watchdog_reset") {
             watchdog.reset();
+            relayBox.setSafetyModeBlocked(false);
+        }
+        else if (command.startsWith("mask ")) {
+            String hex = command.substring(5);
+            hex.trim();
+            if (hex.startsWith("0x") || hex.startsWith("0X")) {
+                hex = hex.substring(2);
+            }
+            uint8_t mask = (uint8_t)strtoul(hex.c_str(), nullptr, 16);
+            bool ok = relayBox.applyRelayMask(mask, 0);
+            Serial.printf("[PROC] SET_RELAY_MASK 0x%02X %s actual=0x%02X pcf=%d\n",
+                          mask, ok ? "OK" : "FAIL",
+                          relayBox.getRelayMask(),
+                          relayBox.isOperational() ? 1 : 0);
         }
         else if (command.startsWith("relay ")) {
             // Verificar se é comando especial relay off_all ou relay on_all
@@ -1287,11 +1379,8 @@ void handleSerialCommands() {
                 Serial.println("🔄 Todos os relés desligados");
             }
             else if (command == "relay on_all") {
-                Serial.println("🔌 Ligando todos os relés permanentemente...");
-                for (int i = 0; i < 8; i++) {
-                    relayBox.processCommand(i, "on_forever", 0);
-                }
-                Serial.println("✅ Todos os relés ligados permanentemente");
+                bool ok = relayBox.applyRelayMask(0xFF, 0);
+                Serial.printf("[PROC] SET_RELAY_MASK 0xFF %s\n", ok ? "OK" : "FAIL");
             }
             else {
                 // Comando: relay <número> <ação> [duração]
@@ -1302,19 +1391,26 @@ void handleSerialCommands() {
                     int secondSpace = command.indexOf(' ', firstSpace + 1);
                     String action;
                     int duration = 0;
+                    int extra = 0;
                     
                     if (secondSpace > 0) {
-                        // Tem duração: relay 1 on 30
                         action = command.substring(firstSpace + 1, secondSpace);
-                        duration = command.substring(secondSpace + 1).toInt();
+                        String rest = command.substring(secondSpace + 1);
+                        rest.trim();
+                        int thirdSpace = rest.indexOf(' ');
+                        if (thirdSpace > 0) {
+                            duration = rest.substring(0, thirdSpace).toInt();
+                            extra = rest.substring(thirdSpace + 1).toInt();
+                        } else {
+                            duration = rest.toInt();
+                        }
                     } else {
-                        // Sem duração: relay 1 on ou relay 1 on_forever
                         action = command.substring(firstSpace + 1);
                         action.trim();
                     }
                     
                     if (relayNumber >= 0 && relayNumber < 8) {
-                        bool success = relayBox.processCommand(relayNumber, action, duration);
+                        bool success = relayBox.processCommand(relayNumber, action, duration, extra);
                         if (success) {
                             Serial.println("✅ Comando executado: Relé " + String(relayNumber) + " -> " + action);
                         } else {
@@ -1628,6 +1724,7 @@ void printHelp() {
     Serial.println();
     Serial.println("🛡️ WATCHDOG:");
     Serial.println("   watchdog_status             - Status do SafetyWatchdog");
+    Serial.println("   system_health               - Diagnóstico completo (reset, heap, recovery)");
     Serial.println("   watchdog_reset              - Resetar watchdog manualmente");
     Serial.println();
     Serial.println("🤝 VALIDAÇÃO BIDIRECIONAL:");
@@ -1647,11 +1744,13 @@ void printHelp() {
     Serial.println();
     Serial.println("🔌 CONTROLE DE RELÉS (0-7):");
     Serial.println("   relay <n> on [tempo]    - Ligar relé");
+    Serial.println("   relay <n> cycle <on> <off> - Cycle local (ex: 300 600)");
     Serial.println("   relay <n> on_forever    - Ligar relé permanentemente");
     Serial.println("   relay <n> off           - Desligar relé");
     Serial.println("   relay <n> toggle        - Alternar relé");
     Serial.println("   relay off_all           - Desligar todos os relés");
-    Serial.println("   relay on_all            - Ligar todos os relés permanentemente");
+    Serial.println("   relay on_all            - Máscara 0xFF (1 write8)");
+    Serial.println("   mask <hex>              - Máscara atómica (ex: mask FF, mask 00)");
     Serial.println("   off_all                 - Desligar todos");
     Serial.println("   on_all                  - Ligar todos os relés permanentemente");
     Serial.println();
@@ -1660,6 +1759,7 @@ void printHelp() {
     Serial.println("   auto_validation           - Validação automática completa");
     Serial.println("   connectivity_report       - Enviar relatório de status");
     Serial.println("   relay 0 on 30            - Liga relé 0 por 30s");
+    Serial.println("   relay 0 cycle 5 5        - Cycle 5s ON / 5s OFF");
     Serial.println("   relay 0 on               - Liga relé 0 permanentemente");
     Serial.println("   relay 0 on_forever       - Liga relé 0 permanentemente");
     Serial.println("   relay 1 off              - Desliga relé 1");
@@ -1801,6 +1901,20 @@ void checkSignalQuality() {
  * @brief Implementa estratégia de fallback quando comunicação falha
  */
 void implementFallbackStrategy() {
+    if (multiChannelDiscovery && multiChannelDiscovery->isMasterChannelLocked()) {
+        Serial.println("🔒 Canal locked — fallback suave (sem deinit/scan 1-13)");
+        if (espNowBridge) {
+            espNowBridge->ensureBroadcastPeer();
+            auto peers = espNowBridge->getPeerList();
+            if (!peers.empty()) {
+                espNowBridge->sendPing(peers[0].macAddress);
+            } else {
+                espNowBridge->sendDiscoveryBroadcast();
+            }
+        }
+        return;
+    }
+
     Serial.println("🔄 Implementando estratégia de fallback...");
     
     // 1. Tentar reconectar WiFi
@@ -1934,6 +2048,7 @@ void scanChannelsForMaster() {
  * @brief Callback quando Master é encontrado
  */
 void onMasterFound(uint8_t channel, const uint8_t* masterMac) {
+    lastMasterRxMs = millis();
     if (channelSyncCompleted && channel == masterChannel &&
         multiChannelDiscovery && multiChannelDiscovery->isMasterChannelLocked()) {
         return;
@@ -2028,32 +2143,68 @@ void onDiscoveryProgress(uint8_t channel, uint8_t totalChannels) {
     // Serial.print(".");
 }
 
+static void softReaddAndPingMaster() {
+    if (!espNowBridge) return;
+    Serial.println("🔁 Re-add peer + ping no canal atual (sem scan 1-13)");
+    espNowBridge->ensureBroadcastPeer();
+    auto peers = espNowBridge->getPeerList();
+    if (!peers.empty()) {
+        espNowBridge->sendPing(peers[0].macAddress);
+    } else {
+        espNowBridge->sendDiscoveryBroadcast();
+    }
+}
+
 /**
- * @brief Executa re-discovery automático se Master perdido
+ * @brief Re-discovery só se nunca houve lock. Canal locked: só re-add + ping.
  */
 void performRediscoveryIfNeeded() {
     static unsigned long lastRediscoveryAttempt = 0;
     static unsigned long rediscoveryInterval = SLAVE_REDISCOVERY_INITIAL_MS;
+    static unsigned long lastSoftReaddMs = 0;
     static unsigned long slaveBootMs = 0;
     if (slaveBootMs == 0) slaveBootMs = millis();
 
-    // Link estável: não fazer scan
-    if (channelSyncCompleted && masterConnected && !watchdog.isSafetyMode() &&
-        multiChannelDiscovery && multiChannelDiscovery->isMasterChannelLocked()) {
+    const bool locked = multiChannelDiscovery && multiChannelDiscovery->isMasterChannelLocked();
+    const uint8_t nvsCh = multiChannelDiscovery ? multiChannelDiscovery->getCache().lastChannel : 0;
+    const uint8_t curCh = multiChannelDiscovery ? multiChannelDiscovery->getCurrentChannel() : 0;
+    const bool stayOnNvs = (nvsCh >= 2 && nvsCh <= 13 && curCh == nvsCh);
+    const unsigned long rxAge = (lastMasterRxMs == 0) ? 0 : (millis() - lastMasterRxMs);
+
+    if (channelSyncCompleted && masterConnected && !watchdog.isSafetyMode() && locked) {
+        return;
+    }
+
+    if (stayOnNvs && !watchdog.isSafetyMode()) {
+#if ESPNOW_LOCK_DEBUG
+        static unsigned long lastStayLog = 0;
+        if (millis() - lastStayLog > 15000UL) {
+            Serial.printf("[LOCK] stay ch=%u skip rediscover lastRxAgeMs=%lu\n",
+                          curCh, rxAge);
+            lastStayLog = millis();
+        }
+#endif
+        if ((failedPingCount >= maxFailedPings || (!masterConnected && channelSyncCompleted)) &&
+            (millis() - lastSoftReaddMs > 15000UL)) {
+            softReaddAndPingMaster();
+            lastSoftReaddMs = millis();
+        }
+        return;
+    }
+
+    if (locked && !watchdog.isSafetyMode()) {
+        const bool linkSoftFail =
+            (failedPingCount >= maxFailedPings) || (!masterConnected && channelSyncCompleted);
+        if (linkSoftFail && (millis() - lastSoftReaddMs > 15000UL)) {
+            softReaddAndPingMaster();
+            lastSoftReaddMs = millis();
+        }
         return;
     }
     
     bool needsRediscovery = false;
     
-    // Condição 0: nunca encontrou master
     if (!masterConnected && !channelSyncCompleted) {
-#if ESPNOW_FIXED_CHANNEL_ENABLED
-        if (millis() - slaveBootMs < 5000) {
-            return;
-        }
-        needsRediscovery = true;
-        rediscoveryInterval = 15000;
-#else
         if (millis() - slaveBootMs < SLAVE_REDISCOVERY_INITIAL_MS) {
             return;
         }
@@ -2066,34 +2217,25 @@ void performRediscoveryIfNeeded() {
                            "s no canal NVS antes do scan...");
             firstAttempt = false;
         }
-#endif
     }
     
     if (watchdog.isSafetyMode()) {
         needsRediscovery = true;
         rediscoveryInterval = 45000;
     }
-    
-    if (failedPingCount >= maxFailedPings) {
+
+    if (!locked && failedPingCount >= maxFailedPings) {
         needsRediscovery = true;
         rediscoveryInterval = SLAVE_REDISCOVERY_INITIAL_MS;
     }
     
-    if (!masterConnected && channelSyncCompleted) {
+    if (!locked && !masterConnected && channelSyncCompleted) {
         needsRediscovery = true;
         rediscoveryInterval = SLAVE_REDISCOVERY_INITIAL_MS;
-#if !ESPNOW_FIXED_CHANNEL_ENABLED
-        if (failedPingCount >= maxFailedPings) {
-            if (multiChannelDiscovery) {
-                multiChannelDiscovery->lockMasterChannel(false);
-            }
-            if (espNowBridge && espNowBridge->getESPNowController()) {
-                espNowBridge->getESPNowController()->setDiscoverySuppressed(false);
-            }
-        }
-#endif
     }
     
+    if (!multiChannelDiscovery) return;
+
     if (needsRediscovery && (millis() - lastRediscoveryAttempt > rediscoveryInterval)) {
         Serial.println("\n🔄 === INICIANDO RE-DISCOVERY ===");
         Serial.println("Motivo: " + String(

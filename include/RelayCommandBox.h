@@ -60,6 +60,13 @@ public:
      * @brief Atualiza timers e estados (chamar no loop principal)
      */
     void update();
+
+    /**
+     * @brief Bloqueia ligar relés enquanto SafetyMode estiver ativo
+     */
+    void setSafetyModeBlocked(bool blocked) { safetyModeBlocked = blocked; }
+
+    bool isSafetyModeBlocked() const { return safetyModeBlocked; }
     
     // ===== CONTROLE DE RELÉS =====
     
@@ -79,6 +86,9 @@ public:
      * @return true se comando foi executado com sucesso
      */
     bool setRelayWithTimer(int relayNumber, bool state, int seconds);
+
+    bool startCycle(int relayNumber, uint32_t onSec, uint32_t offSec);
+    bool stopCycle(int relayNumber);
     
     /**
      * @brief Alterna o estado de um relé
@@ -94,12 +104,21 @@ public:
      * @param duration Duração em segundos (0 = sem timer)
      * @return true se comando foi processado com sucesso
      */
-    bool processCommand(int relayNumber, String action, int duration = 0);
+    bool processCommand(int relayNumber, String action, int duration = 0, int extra = 0);
     
     /**
      * @brief Desliga todos os relés
      */
     void turnOffAllRelays();
+
+    /**
+     * Aplica máscara 8 bits de forma atómica (um write8).
+     * bit i = relé i, 1 = ON. durationSec 0 = sem timer de grupo.
+     * Falha se PCF offline ou SafetyMode com bits ON.
+     */
+    bool applyRelayMask(uint8_t mask, uint16_t durationSec);
+
+    uint8_t getRelayMask() const;
     
     // ===== 🎯 PERSISTÊNCIA DE ESTADOS (NVS) =====
     
@@ -214,6 +233,7 @@ private:
     bool pcfInitialized;                      // Status de inicialização
     
     RelayState relayStates[8];       // Estados dos relés (8 relés)
+    bool safetyModeBlocked = false;
     
     // Callbacks
     void (*stateChangeCallback)(int relayNumber, bool state, int remainingTime) = nullptr;
@@ -228,18 +248,23 @@ private:
      * @return true se escrita foi bem sucedida
      */
     bool writeToRelay(int relayNumber, bool state);
+    bool commitRelayHardware(int relayNumber, bool on);
+    void clearSchedule(int relayNumber);
     
     /**
      * @brief Verifica e processa timers ativos
      */
     void checkTimers();
+
+    uint32_t getMaxDuration(int relayNumber) const;
+    bool enforceMaxDurationOnRelay(int relayNumber);
     
     /**
      * @brief Valida número do relé
      * @param relayNumber Número do relé a validar
      * @return true se número é válido (0-7)
      */
-    bool isValidRelayNumber(int relayNumber);
+    bool isValidRelayNumber(int relayNumber) const;
     
     /**
      * @brief Inicializa nomes padrão dos relés

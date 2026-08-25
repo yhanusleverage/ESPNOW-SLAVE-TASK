@@ -18,7 +18,12 @@ RelayCommandBox::RelayCommandBox(uint8_t pcf8574Address, const String& deviceNam
         relayStates[i].startTime = 0;
         relayStates[i].timerSeconds = 0;
         relayStates[i].hasTimer = false;
+        relayStates[i].inCycle = false;
+        relayStates[i].cyclePhaseOn = true;
+        relayStates[i].cycleOnSec = 0;
+        relayStates[i].cycleOffSec = 0;
         relayStates[i].name = "";
+        relayStates[i].config = RELAY_CONFIGS[i];
     }
     
     // Inicializar nomes padrão
@@ -53,9 +58,9 @@ bool RelayCommandBox::begin() {
     pcfInitialized = scanAndInitializePCF8574();
     
     if (!pcfInitialized) {
-        Serial.println("⚠️ PCF8574 não encontrado - Modo simulação ativado");
-        Serial.println("💡 Para controle real de relés, conecte PCF8574 nos endereços 0x20-0x27");
-        Serial.println("🎮 Comandos funcionarão em modo simulação");
+        Serial.println("⚠️ PCF8574 não encontrado — hardware OFFLINE");
+        Serial.println("💡 Comandos ON/OFF falharão (ACK fail). Verifique I2C SDA=21 SCL=22, 0x20-0x27");
+        Serial.println("🚫 Modo simulação NÃO finge sucesso no hardware");
         
         // Inicializar estados em modo simulação
         for (int i = 0; i < MAX_RELAYS; i++) {
@@ -65,22 +70,24 @@ bool RelayCommandBox::begin() {
             relayStates[i].hasTimer = false;
         }
         
-        Serial.println("✅ RelayCommandBox inicializado (MODO SIMULAÇÃO): " + deviceName);
-        Serial.println("🎯 Relés disponíveis: 0-" + String(MAX_RELAYS - 1));
-        return true; // Retornar true para permitir funcionamento em simulação
+        Serial.println("⚠️ RelayCommandBox ONLINE sem PCF — firmware segue, relés NÃO atuam");
+        Serial.println("🎯 Relés lógicos: 0-" + String(MAX_RELAYS - 1) + " (PCF offline)");
+        return true;
     }
     
-    // 🎯 PASSO 2: Agora que hardware está inicializado, carregar estados persistentes
-    // IMPORTANTE: Hardware já desligou todos os relays, agora aplicamos estados persistentes
-    Serial.println("💾 Carregando estados persistentes de NVS...");
+#if RELAY_SAFE_BOOT_ALWAYS_OFF
+    turnOffAllRelays();
+    Serial.println("🛡️ Boot seguro: relés OFF — NVS NÃO restaura ON");
+#else
+    Serial.println("💾 Boot: restaurando ON/OFF desde NVS...");
     bool statesLoaded = loadPersistentStates();
     if (statesLoaded) {
-        Serial.println("✅ Estados persistentes carregados e aplicados");
+        Serial.println("✅ Relés restaurados (mesmo estado que antes do reboot)");
     } else {
-        Serial.println("💡 Nenhum estado persistente encontrado - iniciando com estados padrão");
-        // Hardware já desligou todos os relays no scanAndInitializePCF8574()
-        // Não precisamos chamar turnOffAllRelays() novamente
+        Serial.println("💡 Sem NVS de relés — todos OFF");
+        turnOffAllRelays();
     }
+#endif
     
     Serial.println("✅ RelayCommandBox inicializado: " + deviceName);
     Serial.println("🎯 Relés disponíveis: 0-" + String(MAX_RELAYS - 1));
@@ -89,8 +96,57 @@ bool RelayCommandBox::begin() {
 }
 
 void RelayCommandBox::update() {
-    // Sempre verificar timers, mesmo em modo simulação
     checkTimers();
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        if (relayStates[i].isOn) {
+            enforceMaxDurationOnRelay(i);
+        }
+    }
+}
+
+uint32_t RelayCommandBox::getMaxDuration(int relayNumber) const {
+    if (!isValidRelayNumber(relayNumber)) return DEFAULT_MAX_DURATION;
+    return relayStates[relayNumber].config.maxDuration;
+}
+
+void RelayCommandBox::clearSchedule(int relayNumber) {
+    if (!isValidRelayNumber(relayNumber)) return;
+    relayStates[relayNumber].hasTimer = false;
+    relayStates[relayNumber].timerSeconds = 0;
+    relayStates[relayNumber].inCycle = false;
+    relayStates[relayNumber].cyclePhaseOn = true;
+    relayStates[relayNumber].cycleOnSec = 0;
+    relayStates[relayNumber].cycleOffSec = 0;
+}
+
+bool RelayCommandBox::commitRelayHardware(int relayNumber, bool on) {
+    if (!isValidRelayNumber(relayNumber)) return false;
+    if (!pcfInitialized || pcf8574 == nullptr) {
+        Serial.println("❌ PCF8574 não inicializado");
+        return false;
+    }
+    if (!writeToRelay(relayNumber, on)) {
+        return false;
+    }
+    relayStates[relayNumber].isOn = on;
+    relayStates[relayNumber].startTime = millis();
+    return true;
+}
+
+bool RelayCommandBox::enforceMaxDurationOnRelay(int relayNumber) {
+    if (!relayStates[relayNumber].isOn) return false;
+    if (relayStates[relayNumber].inCycle) return false;
+
+    unsigned long elapsed = (millis() - relayStates[relayNumber].startTime) / 1000;
+    uint32_t maxDur = getMaxDuration(relayNumber);
+
+    if (elapsed >= maxDur) {
+        String relayName = relayStates[relayNumber].name.isEmpty() ?
+                          "Relé " + String(relayNumber) : relayStates[relayNumber].name;
+        Serial.println("⏰ maxDuration (" + String(maxDur) + "s) atingido — desligando " + relayName);
+        return setRelay(relayNumber, false);
+    }
+    return false;
 }
 
 bool RelayCommandBox::setRelay(int relayNumber, bool state) {
@@ -98,15 +154,24 @@ bool RelayCommandBox::setRelay(int relayNumber, bool state) {
         Serial.println("❌ Número de relé inválido: " + String(relayNumber));
         return false;
     }
+
+    if (state && safetyModeBlocked) {
+        Serial.println("🚨 SafetyMode ATIVO — relé " + String(relayNumber) + " bloqueado");
+        return false;
+    }
+
+    if (state && relayStates[relayNumber].config.safetyLock) {
+        uint32_t maxDur = getMaxDuration(relayNumber);
+        Serial.println("🔒 safetyLock: relé " + String(relayNumber) + " limitado a " + String(maxDur) + "s");
+        return setRelayWithTimer(relayNumber, true, maxDur);
+    }
     
     if (!pcfInitialized) {
         Serial.println("❌ PCF8574 não inicializado");
         return false;
     }
-    
-    // Cancelar timer se existir
-    relayStates[relayNumber].hasTimer = false;
-    relayStates[relayNumber].timerSeconds = 0;
+
+    clearSchedule(relayNumber);
     
     // Definir novo estado
     relayStates[relayNumber].isOn = state;
@@ -141,6 +206,11 @@ bool RelayCommandBox::setRelayWithTimer(int relayNumber, bool state, int seconds
         Serial.println("❌ Número de relé inválido: " + String(relayNumber));
         return false;
     }
+
+    if (state && safetyModeBlocked) {
+        Serial.println("🚨 SafetyMode ATIVO — relé " + String(relayNumber) + " bloqueado");
+        return false;
+    }
     
     if (!pcfInitialized) {
         Serial.println("❌ PCF8574 não inicializado");
@@ -150,11 +220,13 @@ bool RelayCommandBox::setRelayWithTimer(int relayNumber, bool state, int seconds
     if (seconds <= 0) {
         return setRelay(relayNumber, state);
     }
-    
-    // Validar duração máxima
-    if (seconds > DEFAULT_MAX_DURATION) {
-        Serial.println("⚠️ Duração limitada a " + String(DEFAULT_MAX_DURATION) + " segundos");
-        seconds = DEFAULT_MAX_DURATION;
+
+    clearSchedule(relayNumber);
+
+    uint32_t maxDur = getMaxDuration(relayNumber);
+    if ((uint32_t)seconds > maxDur) {
+        Serial.println("⚠️ Duração limitada a " + String(maxDur) + "s (maxDuration)");
+        seconds = (int)maxDur;
     }
     
     // Configurar estado com timer
@@ -188,6 +260,55 @@ bool RelayCommandBox::setRelayWithTimer(int relayNumber, bool state, int seconds
     return success;
 }
 
+bool RelayCommandBox::startCycle(int relayNumber, uint32_t onSec, uint32_t offSec) {
+    if (!isValidRelayNumber(relayNumber)) {
+        Serial.println("❌ Número de relé inválido: " + String(relayNumber));
+        return false;
+    }
+    if (safetyModeBlocked) {
+        Serial.println("🚨 SafetyMode ATIVO — cycle bloqueado");
+        return false;
+    }
+    if (onSec < 1 || offSec < 1) {
+        Serial.println("❌ Cycle requer onSec e offSec >= 1");
+        return false;
+    }
+
+    uint32_t maxDur = getMaxDuration(relayNumber);
+    if (onSec > maxDur) {
+        Serial.println("⚠️ Cycle ON limitado a " + String(maxDur) + "s (maxDuration)");
+        onSec = maxDur;
+    }
+
+    clearSchedule(relayNumber);
+    relayStates[relayNumber].inCycle = true;
+    relayStates[relayNumber].cyclePhaseOn = true;
+    relayStates[relayNumber].cycleOnSec = onSec;
+    relayStates[relayNumber].cycleOffSec = offSec;
+    relayStates[relayNumber].hasTimer = true;
+    relayStates[relayNumber].timerSeconds = (int)onSec;
+
+    if (!commitRelayHardware(relayNumber, true)) {
+        clearSchedule(relayNumber);
+        return false;
+    }
+
+    Serial.println("🔁 Relé " + String(relayNumber) + " CYCLE ON=" + String(onSec) +
+                   "s OFF=" + String(offSec) + "s");
+    savePersistentStates();
+    if (stateChangeCallback) {
+        stateChangeCallback(relayNumber, true, (int)onSec);
+    }
+    return true;
+}
+
+bool RelayCommandBox::stopCycle(int relayNumber) {
+    if (!isValidRelayNumber(relayNumber)) {
+        return false;
+    }
+    return setRelay(relayNumber, false);
+}
+
 bool RelayCommandBox::toggleRelay(int relayNumber) {
     if (!isValidRelayNumber(relayNumber)) {
         return false;
@@ -197,7 +318,7 @@ bool RelayCommandBox::toggleRelay(int relayNumber) {
     return setRelay(relayNumber, !currentState);
 }
 
-bool RelayCommandBox::processCommand(int relayNumber, String action, int duration) {
+bool RelayCommandBox::processCommand(int relayNumber, String action, int duration, int extra) {
     if (!isValidRelayNumber(relayNumber)) {
         Serial.println("❌ Comando inválido - Relé: " + String(relayNumber));
         return false;
@@ -211,11 +332,10 @@ bool RelayCommandBox::processCommand(int relayNumber, String action, int duratio
         commandCallback(relayNumber, action, duration);
     }
     
-    if (action == "on") {
+    if (action == "on" || action == "timed_on") {
         if (duration > 0) {
             return setRelayWithTimer(relayNumber, true, duration);
         } else {
-            // ON permanente - sem timer
             return setRelay(relayNumber, true);
         }
     }
@@ -224,32 +344,34 @@ bool RelayCommandBox::processCommand(int relayNumber, String action, int duratio
         Serial.println("🔌 Ligando relé " + String(relayNumber) + " permanentemente");
         return setRelay(relayNumber, true);
     } 
-    else if (action == "off") {
+    else if (action == "off" || action == "cycle_stop") {
         return setRelay(relayNumber, false);
     } 
     else if (action == "toggle") {
         return toggleRelay(relayNumber);
     }
     // ===== COMANDOS ESPECÍFICOS PARA HIDROPONIA =====
+    else if (action == "cycle") {
+        uint32_t offSec = extra > 0 ? (uint32_t)extra : (uint32_t)duration;
+        if (duration < 1) duration = 1;
+        if (offSec < 1) offSec = duration;
+        return startCycle(relayNumber, (uint32_t)duration, offSec);
+    }
     else if (action == "pump_cycle") {
-        // Ciclo de bomba: 5min ligada, 10min desligada
-        Serial.println("🌊 Iniciando ciclo de bomba (5min ON)");
-        return setRelayWithTimer(relayNumber, true, 300); // 5 minutos
+        Serial.println("🌊 Ciclo de bomba (5min ON / 10min OFF)");
+        return startCycle(relayNumber, 300, 600);
     }
     else if (action == "light_cycle") {
-        // Ciclo de luz: 16h ligada, 8h desligada
-        Serial.println("💡 Iniciando ciclo de luz (16h ON)");
-        return setRelayWithTimer(relayNumber, true, 57600); // 16 horas
+        Serial.println("💡 Ciclo de luz (16h ON / 8h OFF)");
+        return startCycle(relayNumber, 57600, 28800);
     }
     else if (action == "nutrient_cycle") {
-        // Ciclo de nutrientes: 2min ligada, 58min desligada
-        Serial.println("🧪 Iniciando ciclo de nutrientes (2min ON)");
-        return setRelayWithTimer(relayNumber, true, 120); // 2 minutos
+        Serial.println("🧪 Ciclo de nutrientes (2min ON / 58min OFF)");
+        return startCycle(relayNumber, 120, 3480);
     }
     else if (action == "ventilation_cycle") {
-        // Ciclo de ventilação: 15min ligada, 15min desligada
-        Serial.println("🌬️ Iniciando ciclo de ventilação (15min ON)");
-        return setRelayWithTimer(relayNumber, true, 900); // 15 minutos
+        Serial.println("🌬️ Ciclo de ventilação (15min ON / 15min OFF)");
+        return startCycle(relayNumber, 900, 900);
     }
     else if (action == "emergency_off") {
         // Desligar tudo em emergência
@@ -268,19 +390,84 @@ bool RelayCommandBox::processCommand(int relayNumber, String action, int duratio
     }
     else {
         Serial.println("❌ Ação inválida: '" + action + "'");
-        Serial.println("💡 Comandos disponíveis: on, off, toggle, on_forever, pump_cycle, light_cycle, nutrient_cycle, ventilation_cycle, emergency_off, status");
+        Serial.println("💡 Comandos: on, off, toggle, timed_on, cycle, cycle_stop, on_forever, ...");
         return false;
     }
 }
 
+uint8_t RelayCommandBox::getRelayMask() const {
+    uint8_t mask = 0;
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        if (relayStates[i].isOn) {
+            mask |= (uint8_t)(1u << i);
+        }
+    }
+    return mask;
+}
+
+bool RelayCommandBox::applyRelayMask(uint8_t mask, uint16_t durationSec) {
+    Serial.printf("[PROC] SET_RELAY_MASK 0x%02X dur=%u\n", mask, (unsigned)durationSec);
+
+    if (safetyModeBlocked && mask != 0) {
+        Serial.println("🚨 SafetyMode — máscara ON rejeitada, relés OFF");
+        turnOffAllRelays();
+        return false;
+    }
+
+    if (!pcfInitialized || pcf8574 == nullptr) {
+        Serial.println("❌ PCF8574 offline — SET_RELAY_MASK fail");
+        return false;
+    }
+
+    pcf8574->write8((uint8_t)(~mask));
+
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        const bool on = (mask & (1u << i)) != 0;
+        relayStates[i].inCycle = false;
+        relayStates[i].cycleOnSec = 0;
+        relayStates[i].cycleOffSec = 0;
+        relayStates[i].cyclePhaseOn = true;
+        relayStates[i].isOn = on;
+        relayStates[i].startTime = millis();
+        if (on && durationSec > 0) {
+            uint32_t seconds = durationSec;
+            uint32_t maxDur = getMaxDuration(i);
+            if (seconds > maxDur) {
+                seconds = maxDur;
+            }
+            relayStates[i].hasTimer = true;
+            relayStates[i].timerSeconds = (int)seconds;
+        } else {
+            relayStates[i].hasTimer = false;
+            relayStates[i].timerSeconds = 0;
+        }
+    }
+
+    savePersistentStates();
+    Serial.printf("[PROC] PCF write8(~0x%02X)=0x%02X actual=0x%02X\n",
+                  mask, (unsigned)((uint8_t)~mask), getRelayMask());
+    return true;
+}
+
 void RelayCommandBox::turnOffAllRelays() {
     Serial.println("🔄 Desligando todos os relés...");
-    
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        setRelay(i, false);
-        delay(50); // Pequeno delay entre comandos
+
+    if (pcfInitialized && pcf8574 != nullptr) {
+        pcf8574->write8(0xFF);  // OFF atômico (ativo em LOW)
     }
-    
+
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        relayStates[i].isOn = false;
+        relayStates[i].hasTimer = false;
+        relayStates[i].timerSeconds = 0;
+        relayStates[i].startTime = 0;
+        relayStates[i].inCycle = false;
+        relayStates[i].cyclePhaseOn = true;
+        relayStates[i].cycleOnSec = 0;
+        relayStates[i].cycleOffSec = 0;
+    }
+
+    savePersistentStates();
     Serial.println("✅ Todos os relés desligados");
 }
 
@@ -330,7 +517,10 @@ void RelayCommandBox::printStatus() {
         String status = "   " + getRelayName(i) + ": " + 
                        (relayStates[i].isOn ? "ON" : "OFF");
         
-        if (relayStates[i].hasTimer) {
+        if (relayStates[i].inCycle) {
+            status += " (cycle " + String(relayStates[i].cyclePhaseOn ? "ON" : "OFF") +
+                      " " + String(getRemainingTime(i)) + "s)";
+        } else if (relayStates[i].hasTimer) {
             int remaining = getRemainingTime(i);
             status += " (Timer: " + String(remaining) + "s)";
         }
@@ -356,6 +546,7 @@ String RelayCommandBox::getStatusJSON() {
         relay["name"] = getRelayName(i);
         relay["state"] = relayStates[i].isOn;
         relay["hasTimer"] = relayStates[i].hasTimer;
+        relay["inCycle"] = relayStates[i].inCycle;
         
         if (relayStates[i].hasTimer) {
             relay["remainingTime"] = getRemainingTime(i);
@@ -400,10 +591,9 @@ bool RelayCommandBox::writeToRelay(int relayNumber, bool state) {
         return false;
     }
     
-    // Se PCF8574 não está inicializado, funcionar em modo simulação
-    if (!pcfInitialized) {
-        Serial.println("🎮 [SIMULAÇÃO] Relé " + String(relayNumber) + " -> " + (state ? "LIGADO" : "DESLIGADO"));
-        return true; // Simular sucesso
+    if (!pcfInitialized || pcf8574 == nullptr) {
+        Serial.println("❌ writeToRelay: PCF8574 offline — sem ACK de sucesso");
+        return false;
     }
     
     try {
@@ -423,11 +613,34 @@ bool RelayCommandBox::writeToRelay(int relayNumber, bool state) {
 
 void RelayCommandBox::checkTimers() {
     for (int i = 0; i < MAX_RELAYS; i++) {
+        if (relayStates[i].inCycle) {
+            uint32_t phaseSec = relayStates[i].cyclePhaseOn
+                ? relayStates[i].cycleOnSec
+                : relayStates[i].cycleOffSec;
+            if (phaseSec < 1) continue;
+            unsigned long elapsed = (millis() - relayStates[i].startTime) / 1000UL;
+            if (elapsed >= phaseSec) {
+                relayStates[i].cyclePhaseOn = !relayStates[i].cyclePhaseOn;
+                bool nextOn = relayStates[i].cyclePhaseOn;
+                uint32_t nextSec = nextOn ? relayStates[i].cycleOnSec : relayStates[i].cycleOffSec;
+                relayStates[i].hasTimer = true;
+                relayStates[i].timerSeconds = (int)nextSec;
+                if (commitRelayHardware(i, nextOn)) {
+                    Serial.println("🔁 Relé " + String(i) + " cycle → " +
+                               String(nextOn ? "ON" : "OFF") + " " + String(nextSec) + "s");
+                    savePersistentStates();
+                    if (stateChangeCallback) {
+                        stateChangeCallback(i, nextOn, (int)nextSec);
+                    }
+                }
+            }
+            continue;
+        }
+
         if (relayStates[i].hasTimer && relayStates[i].isOn) {
             unsigned long elapsed = (millis() - relayStates[i].startTime) / 1000;
             
-            if (elapsed >= relayStates[i].timerSeconds) {
-                // Timer expirou - desligar relé
+            if (elapsed >= (unsigned long)relayStates[i].timerSeconds) {
                 String relayName = getRelayName(i);
                 Serial.println("⏰ Timer do " + relayName + " expirou - desligando");
                 
@@ -436,11 +649,8 @@ void RelayCommandBox::checkTimers() {
                 relayStates[i].timerSeconds = 0;
                 
                 writeToRelay(i, false);
-                
-                // 🎯 Guardar estado en NVS cuando expira timer
                 savePersistentStates();
                 
-                // Chamar callback se definido
                 if (stateChangeCallback) {
                     stateChangeCallback(i, false, 0);
                 }
@@ -449,17 +659,17 @@ void RelayCommandBox::checkTimers() {
     }
 }
 
-bool RelayCommandBox::isValidRelayNumber(int relayNumber) {
+bool RelayCommandBox::isValidRelayNumber(int relayNumber) const {
     return relayNumber >= 0 && relayNumber < MAX_RELAYS;
 }
 
 void RelayCommandBox::initializeDefaultNames() {
-    // Usar nomes do Config.h
     for (int i = 0; i < MAX_RELAYS; i++) {
         relayStates[i].name = String(RELAY_NAMES[i]);
+        relayStates[i].config = RELAY_CONFIGS[i];
     }
     
-    DEBUG_PRINTLN("✅ Nomes padrão dos relés carregados do Config.h");
+    DEBUG_PRINTLN("✅ Relés identificados por índice (Relé 0–7)");
 }
 
 bool RelayCommandBox::scanAndInitializePCF8574() {
@@ -497,15 +707,18 @@ bool RelayCommandBox::scanAndInitializePCF8574() {
                 i2cAddress = address;
                 DEBUG_PRINTLN("✓ PCF8574 confirmado no endereço 0x" + String(address, HEX));
                 
-                // 🎯 CRÍTICO: Desligar TODOS os relés primeiro (antes de aplicar estados persistentes)
-                DEBUG_PRINTLN("🔄 Desligando todos os relés inicialmente...");
+                // OFF atômico: 0xFF = todos HIGH (relé ativo em LOW = desligado)
+                // Evita 8 writes com delay que poderiam deixar pins flutuantes/glitch
+                DEBUG_PRINTLN("🔄 Forçando porta PCF8574 = 0xFF (todos OFF)...");
+                pcf8574->write8(0xFF);
                 for (int i = 0; i < MAX_RELAYS; i++) {
-                    pcf8574->write(i, HIGH);  // HIGH = desligado
-                    delay(10); // Pequeno delay entre comandos
+                    relayStates[i].isOn = false;
+                    relayStates[i].hasTimer = false;
+                    relayStates[i].timerSeconds = 0;
+                    relayStates[i].startTime = 0;
                 }
                 
-                DEBUG_PRINTLN("✅ PCF8574 inicializado com sucesso!");
-                DEBUG_PRINTLN("✅ Todos os relés desligados (estados persistentes serão aplicados depois)");
+                DEBUG_PRINTLN("✅ PCF8574 inicializado — todos os relés OFF");
                 return true;
             } else {
                 delete test_pcf;
@@ -544,22 +757,29 @@ bool RelayCommandBox::savePersistentStates() {
     PersistentRelayStateData states = {};
     states.timestamp = millis();
     states.numRelays = MAX_RELAYS;
-    states.version = 1;  // Versão inicial
+    states.version = 2;
     
-    // Preencher estados de cada relé
     for (int i = 0; i < MAX_RELAYS; i++) {
         states.relays[i].state = relayStates[i].isOn ? 1 : 0;
         states.relays[i].hasTimer = relayStates[i].hasTimer ? 1 : 0;
+        states.relays[i].inCycle = relayStates[i].inCycle ? 1 : 0;
+        states.relays[i].cyclePhaseOn = relayStates[i].cyclePhaseOn ? 1 : 0;
+        states.relays[i].cycleOnSec = (uint16_t)constrain(relayStates[i].cycleOnSec, 0, 65535);
+        states.relays[i].cycleOffSec = (uint16_t)constrain(relayStates[i].cycleOffSec, 0, 65535);
         
-        if (relayStates[i].hasTimer && relayStates[i].isOn) {
-            // Calcular timestamp de expiração do timer
-            states.relays[i].timerEndTime = relayStates[i].startTime + (relayStates[i].timerSeconds * 1000);
+        if (relayStates[i].hasTimer || relayStates[i].inCycle) {
+            unsigned long elapsed = (millis() - relayStates[i].startTime) / 1000UL;
+            uint32_t remaining = 0;
+            if ((unsigned long)relayStates[i].timerSeconds > elapsed) {
+                remaining = relayStates[i].timerSeconds - elapsed;
+            }
+            states.relays[i].timerEndTime = remaining;
         } else {
             states.relays[i].timerEndTime = 0;
         }
         
-        // Estado persistente = ON sem timer (on_forever)
-        states.relays[i].isPersistent = (relayStates[i].isOn && !relayStates[i].hasTimer) ? 1 : 0;
+        states.relays[i].isPersistent = (relayStates[i].isOn && !relayStates[i].hasTimer &&
+                                         !relayStates[i].inCycle) ? 1 : 0;
     }
     
     // Calcular checksum
@@ -640,34 +860,55 @@ bool RelayCommandBox::applyPersistentStates(const PersistentRelayStateData& stat
     Serial.println("🎯 APLICANDO ESTADOS PERSISTENTES");
     Serial.println("🎯 ========================================");
     Serial.println("📦 Total de relés: " + String(states.numRelays));
-    Serial.println("📅 Timestamp: " + String(states.timestamp));
+    Serial.println("📅 Timestamp: " + String(states.timestamp) + " v" + String(states.version));
     
     bool applied = false;
     
     for (int i = 0; i < MAX_RELAYS && i < states.numRelays; i++) {
-        if (states.relays[i].isPersistent) {
-            // 🔒 ESTADO PERSISTENTE (on_forever) - aplicar imediatamente
-            Serial.println("🔒 Relé " + String(i) + ": Aplicando estado PERSISTENTE " + 
-                         (states.relays[i].state ? "ON" : "OFF"));
-            setRelay(i, states.relays[i].state == 1);
-            applied = true;
-        } 
-        else if (states.relays[i].hasTimer && states.relays[i].state == 1) {
-            // ⏰ TIMER ATIVO - verificar se ainda válido
-            uint32_t currentTime = millis();
-            if (states.relays[i].timerEndTime > currentTime) {
-                uint32_t remaining = (states.relays[i].timerEndTime - currentTime) / 1000;
-                Serial.println("⏰ Relé " + String(i) + ": Aplicando timer com " + String(remaining) + "s restantes");
+        if (states.relays[i].inCycle && states.relays[i].cycleOnSec > 0 &&
+            states.relays[i].cycleOffSec > 0) {
+            uint32_t onSec = states.relays[i].cycleOnSec;
+            uint32_t offSec = states.relays[i].cycleOffSec;
+            uint32_t maxDur = getMaxDuration(i);
+            if (onSec > maxDur) onSec = maxDur;
+            bool phaseOn = states.relays[i].cyclePhaseOn != 0;
+            uint32_t phaseSec = phaseOn ? onSec : offSec;
+            uint32_t remaining = states.relays[i].timerEndTime;
+            if (remaining == 0 || remaining > phaseSec) remaining = phaseSec;
+
+            clearSchedule(i);
+            relayStates[i].inCycle = true;
+            relayStates[i].cyclePhaseOn = phaseOn;
+            relayStates[i].cycleOnSec = onSec;
+            relayStates[i].cycleOffSec = offSec;
+            relayStates[i].hasTimer = true;
+            relayStates[i].timerSeconds = (int)phaseSec;
+            if (commitRelayHardware(i, phaseOn)) {
+                unsigned long already = (phaseSec > remaining) ? (phaseSec - remaining) : 0;
+                relayStates[i].startTime = millis() - (already * 1000UL);
+                Serial.println("🔁 Relé " + String(i) + ": cycle restaurado " +
+                               String(phaseOn ? "ON" : "OFF") + " " + String(remaining) + "s");
+                applied = true;
+            }
+        } else if (states.relays[i].hasTimer) {
+            uint32_t remaining = states.relays[i].timerEndTime;
+            if (remaining > 86400) remaining = 0;
+            if (remaining > 0 && states.relays[i].state == 1) {
+                Serial.println("⏰ Relé " + String(i) + ": timer " + String(remaining) + "s restantes");
                 setRelayWithTimer(i, true, remaining);
                 applied = true;
             } else {
-                Serial.println("⏰ Relé " + String(i) + ": Timer expirado - desligando");
-                setRelay(i, false);
+                commitRelayHardware(i, false);
             }
-        }
-        else if (!states.relays[i].state) {
-            // OFF - garantir que está desligado
-            setRelay(i, false);
+        } else if (states.relays[i].isPersistent || states.relays[i].state == 1) {
+            Serial.println("🔌 Relé " + String(i) + ": restaurando ON");
+            clearSchedule(i);
+            if (commitRelayHardware(i, true)) {
+                applied = true;
+            }
+        } else {
+            clearSchedule(i);
+            commitRelayHardware(i, false);
         }
     }
     
@@ -686,21 +927,18 @@ bool RelayCommandBox::getPersistentStates(PersistentRelayStateData& states) {
     states = {};
     states.timestamp = millis();
     states.numRelays = MAX_RELAYS;
-    states.version = 1;
+    states.version = 2;
     
-    // Preencher estados atuais
     for (int i = 0; i < MAX_RELAYS; i++) {
         states.relays[i].state = relayStates[i].isOn ? 1 : 0;
         states.relays[i].hasTimer = relayStates[i].hasTimer ? 1 : 0;
-        
-        if (relayStates[i].hasTimer && relayStates[i].isOn) {
-            states.relays[i].timerEndTime = relayStates[i].startTime + (relayStates[i].timerSeconds * 1000);
-        } else {
-            states.relays[i].timerEndTime = 0;
-        }
-        
-        // Estado persistente = ON sem timer (on_forever)
-        states.relays[i].isPersistent = (relayStates[i].isOn && !relayStates[i].hasTimer) ? 1 : 0;
+        states.relays[i].inCycle = relayStates[i].inCycle ? 1 : 0;
+        states.relays[i].cyclePhaseOn = relayStates[i].cyclePhaseOn ? 1 : 0;
+        states.relays[i].cycleOnSec = (uint16_t)relayStates[i].cycleOnSec;
+        states.relays[i].cycleOffSec = (uint16_t)relayStates[i].cycleOffSec;
+        states.relays[i].timerEndTime = (uint32_t)getRemainingTime(i);
+        states.relays[i].isPersistent = (relayStates[i].isOn && !relayStates[i].hasTimer &&
+                                         !relayStates[i].inCycle) ? 1 : 0;
     }
     
     // Calcular checksum

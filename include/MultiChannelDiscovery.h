@@ -37,16 +37,16 @@
 // ===== CONFIGURAÇÕES =====
 #define MCD_MIN_CHANNEL 1                    // Canal mínimo (mundial)
 #define MCD_MAX_CHANNEL 13                   // Canal máximo (Europa/Ásia)
-#define MCD_TIMEOUT_PER_CHANNEL 800          // ✅ Timeout por canal aumentado para 800ms
-#define MCD_MAX_RETRY_ATTEMPTS 4             // ✅ 4 tentativas por canal (era 3)
-#define MCD_PASSIVE_LISTEN_MS 45000          // Escuta passiva alinhada com SLAVE_REACHABLE_MS (45s)
+#define MCD_TIMEOUT_PER_CHANNEL 3000         // Master precisa ~1s (peer + handshake)
+#define MCD_MAX_RETRY_ATTEMPTS 2             // 2 × 1.5s = 3s por canal
+#define MCD_PASSIVE_LISTEN_MS 8000           // NVS velho não pode prender 45s no canal errado
 #define MCD_CACHE_ENABLED true               // Usar cache NVS
 #define MCD_NVS_NAMESPACE "mcd_cache"        // Namespace NVS
 #define MCD_DEBUG_ENABLED true               // Logs detalhados
 
 // ===== PRIORIDADE DE CANAIS =====
 // ✅ Canais WiFi mais comuns + canal 9 (comum para WiFi 2.4GHz)
-static const uint8_t MCD_PRIORITY_CHANNELS[] = {1, 6, 9, 11};
+static const uint8_t MCD_PRIORITY_CHANNELS[] = {1, 6, 11, 5};
 static const uint8_t MCD_PRIORITY_COUNT = 4;
 
 /**

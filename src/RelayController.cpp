@@ -274,27 +274,8 @@ uint8_t RelayController::getPCFPin(int relayNumber) {
 }
 
 void RelayController::initializeDefaultNames() {
-    const char* defaultNames[16] = {
-        "Bomba Principal",    // Relé 0
-        "Bomba Auxiliar",    // Relé 1
-        "Luzes LED 1",       // Relé 2
-        "Luzes LED 2",       // Relé 3
-        "Ventilador 1",      // Relé 4
-        "Ventilador 2",      // Relé 5
-        "Aquecedor",         // Relé 6
-        "Resfriador",        // Relé 7
-        "Solenoide 1",       // Relé 8
-        "Solenoide 2",       // Relé 9
-        "Solenoide 3",       // Relé 10
-        "Solenoide 4",       // Relé 11
-        "Alarme Sonoro",     // Relé 12
-        "Alarme Visual",     // Relé 13
-        "Reserva 1",         // Relé 14
-        "Reserva 2"          // Relé 15
-    };
-    
     for (int i = 0; i < 16; i++) {
-        _relayStates[i].name = String(defaultNames[i]);
+        _relayStates[i].name = "Relé " + String(i);
     }
     
     DEBUG_PRINTLN("✅ Nomes padrão dos relés configurados");

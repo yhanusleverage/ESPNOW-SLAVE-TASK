@@ -1097,6 +1097,10 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
             break;
         }
         
+        case MessageType::ALL_RELAYS_STATUS:
+        case MessageType::SET_RELAY_MASK:
+            break;
+
         default:
             Serial.println("❓ Tipo de mensagem desconhecido: " + String((int)message.type));
             break;
@@ -1385,7 +1389,7 @@ bool ESPNowController::respondToHandshake(const uint8_t* targetMac, uint32_t ses
     return sendMessage(message, targetMac);
 }
 
-bool ESPNowController::sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId) {
+bool ESPNowController::sendConnectivityReport(const uint8_t* targetMac, uint32_t sessionId, int operationalOverride) {
     if (!initialized) return false;
     
     ESPNowMessage message = {};
@@ -1408,7 +1412,11 @@ bool ESPNowController::sendConnectivityReport(const uint8_t* targetMac, uint32_t
     report.uptime = millis();
     report.freeHeap = ESP.getFreeHeap();
     report.messageCount = messagesSent + messagesReceived;
-    report.operational = initialized && (ESP.getFreeHeap() > 10000);
+    if (operationalOverride >= 0) {
+        report.operational = operationalOverride != 0;
+    } else {
+        report.operational = initialized && (ESP.getFreeHeap() > 10000);
+    }
     
     message.dataSize = sizeof(ConnectivityReportData);
     memcpy(message.data, &report, sizeof(ConnectivityReportData));

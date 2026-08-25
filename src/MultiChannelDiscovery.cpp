@@ -120,9 +120,18 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
         }
         Serial.println("⚪ Sem resposta");
     }
+
+    const bool nvsKnown = (cache.lastChannel >= 2 && cache.lastChannel <= MCD_MAX_CHANNEL);
+    if (nvsKnown) {
+#if ESPNOW_LOCK_DEBUG
+        Serial.printf("[SCAN] skip hop Fase1 — NVS canal %u lastRx stay\n", cache.lastChannel);
+#endif
+        restoreAfterFailedScan();
+        return DiscoveryResult::TIMEOUT;
+    }
     
     // ===== FASE 1: CANAIS PRIORITÁRIOS =====
-    Serial.println("\n📡 Fase 1: Canais prioritários (1, 6, 9, 11)");
+    Serial.println("\n📡 Fase 1: Canais prioritários (1, 6, 11, 5)");
     
     for (uint8_t i = 0; i < MCD_PRIORITY_COUNT; i++) {
         if (abortFlag) {
@@ -163,7 +172,7 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
     
     // ===== FASE 2: VARREDURA COMPLETA (omitida se cache confiável) =====
     if (MCD_CACHE_ENABLED && cache.successRate >= 50 &&
-        cache.lastChannel >= MCD_MIN_CHANNEL && cache.lastChannel <= MCD_MAX_CHANNEL) {
+        cache.lastChannel >= 2 && cache.lastChannel <= MCD_MAX_CHANNEL) {
         Serial.printf("\n📡 Fase 2: retry cache canal %u (scan completo omitido)\n",
                       cache.lastChannel);
         if (tryChannel(cache.lastChannel, MCD_TIMEOUT_PER_CHANNEL * 2)) {
@@ -289,6 +298,9 @@ bool MultiChannelDiscovery::tryChannel(uint8_t channel, uint32_t timeout) {
     }
     
     currentChannel = channel;
+    if (masterFound) {
+        return true;
+    }
     
     // ✅ OTIMIZAÇÃO: Dividir timeout entre tentativas para não demorar muito
     uint32_t timeoutPerAttempt = timeout / MCD_MAX_RETRY_ATTEMPTS;
@@ -444,11 +456,22 @@ bool MultiChannelDiscovery::passiveListen(uint8_t channel, uint32_t timeoutMs) {
 }
 
 void MultiChannelDiscovery::restoreAfterFailedScan() {
-    uint8_t restoreCh = (cache.lastChannel >= MCD_MIN_CHANNEL && cache.lastChannel <= MCD_MAX_CHANNEL)
-        ? cache.lastChannel : listenChannel;
+    // Se o Master já respondeu, NÃO voltar ao NVS (ex.: cache 1 com Master no 5).
+    if (masterFound && currentChannel >= MCD_MIN_CHANNEL && currentChannel <= MCD_MAX_CHANNEL) {
+        Serial.printf("🔒 Master visto no canal %u — não restaurar NVS\n", currentChannel);
+        persistKnownMasterChannel(currentChannel);
+        lockMasterChannel(true);
+        return;
+    }
+
+    uint8_t restoreCh = currentChannel;
+    if (restoreCh < MCD_MIN_CHANNEL || restoreCh > MCD_MAX_CHANNEL) {
+        restoreCh = (cache.lastChannel >= MCD_MIN_CHANNEL && cache.lastChannel <= MCD_MAX_CHANNEL)
+            ? cache.lastChannel : listenChannel;
+    }
     if (restoreCh < MCD_MIN_CHANNEL) restoreCh = 1;
 
-    Serial.println("🔧 Restaurando canal " + String(restoreCh) + " após scan falho");
+    Serial.println("🔧 Permanece no canal " + String(restoreCh) + " após scan (não volta ao NVS cego)");
 
     if (restoreChannelDelegate) {
         if (restoreChannelDelegate(restoreCh)) {
@@ -731,8 +754,8 @@ bool MultiChannelDiscovery::sendDiscoveryBroadcast() {
 bool MultiChannelDiscovery::waitForMasterResponse(uint32_t timeout) {
     unsigned long start = millis();
     unsigned long lastWdtFeed = start;
-    masterFound = false;
-    
+    // Não zerar masterFound: o RX callback pode ter marcado no delay() entre broadcasts.
+
     while (millis() - start < timeout) {
         if (masterFound) {
             return true;
@@ -808,6 +831,7 @@ void MultiChannelDiscovery::handleReceivedMessage(const uint8_t* mac, const uint
         
         // Master encontrado!
         masterFound = true;
+        abortFlag = true;
         memcpy(masterMac, mac, 6);
         
         // 🚨 CRÍTICO: Atualizar currentChannel para o canal REAL
