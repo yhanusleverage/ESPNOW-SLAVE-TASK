@@ -1,6 +1,7 @@
 #include "ESPNowBridge.h"
 #include "MultiChannelDiscovery.h"
 #include "ESPNowTypes.h"
+#include "Config.h"
 #include <string.h>
 
 static String normalizeRelayAction(const char* raw, size_t maxLen = 12) {
@@ -799,13 +800,22 @@ void ESPNowBridge::onWiFiCredentialsReceived(const String& ssid, const String& p
         Serial.println("📡 Canal conectado: " + String(connectedChannel));
         
         // ⭐ CRÍTICO: Sincronizar canal ESP-NOW com WiFi
+        esp_wifi_set_channel(connectedChannel, WIFI_SECOND_CHAN_NONE);
         if (instance) {
             instance->wifiChannel = connectedChannel;
             Serial.println("🔧 Canal ESP-NOW atualizado: " + String(instance->wifiChannel));
             Serial.println("✅ Sincronização de canal completa!");
         }
+
+        if (multiChannelDiscovery) {
+            multiChannelDiscovery->persistKnownMasterChannel(connectedChannel);
+            multiChannelDiscovery->lockMasterChannel(true);
+        }
+        if (instance && instance->espNowController) {
+            instance->espNowController->setDiscoverySuppressed(true);
+        }
         
-        // ✅ CORREÇÃO: Salvar credenciais no namespace correεια 
+        // ✅ CORREÇÃO: Salvar credenciais no namespace correto
         Preferences prefs;
         if (prefs.begin("wifi_creds", false)) {  // Mesmo namespace do WiFiCredentialsManager
             prefs.putString("ssid", ssid);
@@ -1216,7 +1226,9 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
         }
         
         case MessageType::PING: {
+#if ESPNOW_LINK_VERBOSE
             Serial.println("🏓 Ping recebido de: " + macToString(senderMac));
+#endif
             
             // Responder com PONG
             ESPNowMessage pongMsg = {};
@@ -1233,7 +1245,9 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
         }
         
         case MessageType::PONG: {
+#if ESPNOW_LINK_VERBOSE
             Serial.println("🏓 Pong recebido de: " + macToString(senderMac));
+#endif
             break;
         }
         
@@ -1355,7 +1369,7 @@ bool ESPNowBridge::validateMessage(const ESPNowMessage& message) {
     // Se precisar validar, use um sistema de sincronização de tempo (NTP)
     
     // ✅ Verificar tipo de mensagem válido (atualizado para incluir novos tipos)
-    if (message.type > MessageType::SET_RELAY_MASK) {
+    if (message.type > MessageType::CHANNEL_CHANGE) {
         Serial.println("❌ Tipo de mensagem inválido: " + String((int)message.type));
         Serial.println("💡 Tipos válidos: 0x01 a 0x10");
         Serial.println("💡 Tipo recebido: 0x" + String((int)message.type, HEX));
@@ -1405,6 +1419,22 @@ void ESPNowBridge::onDataReceived(const uint8_t* mac, const uint8_t* incomingDat
     if (instance->messageReceivedCallback) {
         instance->messageReceivedCallback(mac, incomingData, len);
     }
+
+#if !ESPNOW_LINK_VERBOSE
+    if (len >= (int)sizeof(uint8_t)) {
+        const uint8_t rawType = incomingData[0];
+        if (rawType == static_cast<uint8_t>(MessageType::PING) ||
+            rawType == static_cast<uint8_t>(MessageType::PONG)) {
+            ESPNowMessage message;
+            memset(&message, 0, sizeof(ESPNowMessage));
+            const int copySize = min(len, (int)sizeof(ESPNowMessage));
+            memcpy(&message, incomingData, copySize);
+            instance->messagesReceived++;
+            instance->processReceivedMessage(message, mac);
+            return;
+        }
+    }
+#endif
     
     // LOG: Mensagem recebida
     Serial.println("\n📨 ========================================");

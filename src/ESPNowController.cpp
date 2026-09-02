@@ -10,6 +10,7 @@
 
 // 🔄 FASE 2: Incluir tipos e manager para processar ACKs
 #include "ESPNowTypes.h"
+#include "MultiChannelDiscovery.h"
 
 // Forward declaration para evitar dependência circular
 class MasterSlaveManager;
@@ -120,8 +121,13 @@ void ESPNowController::update() {
     }
 
     static unsigned long lastDiscovery = 0;
-    if (millis() - lastDiscovery > 30000) {
-        Serial.println("🔍 Auto-discovery: Procurando novos dispositivos...");
+    const unsigned long interval = WiFi.isConnected() ? 30000UL : 10000UL;
+    if (millis() - lastDiscovery > interval) {
+        if (!WiFi.isConnected()) {
+            Serial.println("📡 [SLAVE] Re-anunciando presença (provisioning)...");
+        } else {
+            Serial.println("🔍 Auto-discovery: Procurando novos dispositivos...");
+        }
         sendDiscoveryBroadcast();
         lastDiscovery = millis();
     }
@@ -1097,6 +1103,44 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
             break;
         }
         
+        case MessageType::CHANNEL_CHANGE: {
+            if (message.dataSize < sizeof(ChannelChangeNotification)) {
+                break;
+            }
+            ChannelChangeNotification notification;
+            memcpy(&notification, message.data, sizeof(notification));
+            uint8_t structCs = 0;
+            const uint8_t* raw = reinterpret_cast<const uint8_t*>(&notification);
+            for (size_t i = 0; i < sizeof(notification) - 1; ++i) {
+                structCs ^= raw[i];
+            }
+            if (structCs != notification.checksum) {
+                Serial.println("❌ CHANNEL_CHANGE checksum inválido");
+                break;
+            }
+            const uint8_t newCh = notification.newChannel;
+            if (newCh < 1 || newCh > 13) {
+                break;
+            }
+            Serial.printf("\n📢 CHANNEL_CHANGE: %u → %u (motivo %u)\n",
+                          notification.oldChannel, newCh, notification.reason);
+            esp_wifi_set_channel(newCh, WIFI_SECOND_CHAN_NONE);
+            wifiChannel = newCh;
+            extern MultiChannelDiscovery* multiChannelDiscovery;
+            if (multiChannelDiscovery) {
+                multiChannelDiscovery->persistKnownMasterChannel(newCh);
+                multiChannelDiscovery->lockMasterChannel(true);
+            }
+            setDiscoverySuppressed(true);
+            removePeer(senderMac);
+            addPeerWithChannel(senderMac, newCh, "Master");
+            uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            removePeer(broadcastMac);
+            addPeerWithChannel(broadcastMac, newCh, "broadcast");
+            Serial.println("[RES] radio=operational");
+            break;
+        }
+
         case MessageType::ALL_RELAYS_STATUS:
         case MessageType::SET_RELAY_MASK:
             break;

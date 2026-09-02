@@ -80,8 +80,20 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
 #endif
 
     if (masterChannelLocked) {
-        Serial.println("🔒 Scan bloqueado — canal master conhecido");
-        return DiscoveryResult::BLOCKED;
+        uint8_t ch = (cache.lastChannel >= MCD_MIN_CHANNEL && cache.lastChannel <= MCD_MAX_CHANNEL)
+            ? cache.lastChannel : listenChannel;
+        if (ch < MCD_MIN_CHANNEL) {
+            ch = ESPNOW_CONFIG_CHANNEL;
+        }
+        Serial.printf("🔒 Scan bloqueado — só canal NVS %u\n", ch);
+        if (passiveListen(ch, MCD_PASSIVE_LISTEN_MS / 2)) {
+            return DiscoveryResult::SUCCESS;
+        }
+        if (tryChannel(ch, MCD_TIMEOUT_PER_CHANNEL)) {
+            return DiscoveryResult::SUCCESS;
+        }
+        restoreAfterFailedScan();
+        return DiscoveryResult::TIMEOUT;
     }
     
     Serial.println("\n🔍 === INICIANDO DISCOVERY MULTI-CANAL ===");
@@ -248,7 +260,7 @@ DiscoveryResult MultiChannelDiscovery::discoverMaster() {
 }
 
 DiscoveryResult MultiChannelDiscovery::discoverFixedChannelOnly() {
-    const uint8_t ch = ESPNOW_FIXED_CHANNEL;
+    const uint8_t ch = ESPNOW_CONFIG_CHANNEL;
     if (ch < MCD_MIN_CHANNEL || ch > MCD_MAX_CHANNEL) {
         Serial.printf("❌ ESPNOW_FIXED_CHANNEL inválido: %u\n", ch);
         return DiscoveryResult::ERROR_ESP_NOW;
@@ -283,9 +295,7 @@ DiscoveryResult MultiChannelDiscovery::discoverFixedChannelOnly() {
         return DiscoveryResult::SUCCESS;
     }
 
-    persistKnownMasterChannel(ch);
-    lockMasterChannel(true);
-    Serial.println("⚠️ Master sem resposta — permanece no canal fixo escutando");
+    Serial.println("⚠️ Master sem resposta no CONFIG — sem lock (fallback op permitido)");
     return DiscoveryResult::TIMEOUT;
 }
 

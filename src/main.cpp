@@ -97,6 +97,7 @@ void setupCallbacks();
     void onMasterFound(uint8_t channel, const uint8_t* masterMac);
     void onDiscoveryProgress(uint8_t channel, uint8_t totalChannels);
     void performRediscoveryIfNeeded();
+    void tickConfigListenCountdown(unsigned long slaveBootMs);
     void linkMcdToEspNowBridge();
 
     /** Alinhado com master SLAVE_REACHABLE_MS (120s): esperar antes de scan */
@@ -239,8 +240,14 @@ void setup() {
         
         ChannelCache cache = multiChannelDiscovery->getCache();
 #if ESPNOW_FIXED_CHANNEL_ENABLED
-        masterChannel = ESPNOW_FIXED_CHANNEL;
-        Serial.printf("📌 Modo canal FIXO: %u (sem scan multi-canal)\n", masterChannel);
+        if (cache.lastChannel >= 1 && cache.lastChannel <= 13 &&
+            cache.lastChannel != ESPNOW_CONFIG_CHANNEL) {
+            masterChannel = cache.lastChannel;
+            Serial.printf("📦 Boot operacional NVS ch %u (skip CONFIG)\n", masterChannel);
+        } else {
+            masterChannel = ESPNOW_CONFIG_CHANNEL;
+            Serial.printf("📌 Modo canal CONFIG: %u (provisioning, sem scan 1-13)\n", masterChannel);
+        }
 #else
         if (cache.lastChannel > 0 && cache.lastChannel <= 13) {
             masterChannel = cache.lastChannel;
@@ -288,14 +295,11 @@ void setup() {
     
     espNowBridge->syncRadioChannel(masterChannel);
 #if ESPNOW_FIXED_CHANNEL_ENABLED
-    if (multiChannelDiscovery) {
-        multiChannelDiscovery->persistKnownMasterChannel(masterChannel);
-        multiChannelDiscovery->lockMasterChannel(true);
+    if (masterChannel == ESPNOW_CONFIG_CHANNEL) {
+        Serial.printf("📌 Modo CONFIG ch %u — aguardando Master/creds (sem lock no boot)\n", masterChannel);
+    } else {
+        Serial.printf("📌 Boot ch %u — aguardando Master (canal NVS)\n", masterChannel);
     }
-    if (espNowBridge->getESPNowController()) {
-        espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
-    }
-    Serial.printf("🔒 Boot canal fixo %u — MCD locked, scan 1-13 desativado\n", masterChannel);
 #else
     Serial.println("📡 ESPNOW_FIXED_CHANNEL_ENABLED=0 — scan 1-13 até lock NVS");
     Serial.println("   Cache NVS só para escuta inicial; lock após Master responder");
@@ -438,6 +442,11 @@ void loop() {
     delay(100);
 
 #elif defined(SLAVE_MODE)
+    static unsigned long slaveLoopBootMs = 0;
+    if (slaveLoopBootMs == 0) {
+        slaveLoopBootMs = millis();
+    }
+    tickConfigListenCountdown(slaveLoopBootMs);
     // 0. 🔍 RE-DISCOVERY AUTOMÁTICO (se Master perdido)
     if (multiChannelDiscovery) {
         performRediscoveryIfNeeded();
@@ -2156,6 +2165,31 @@ static void softReaddAndPingMaster() {
 }
 
 /**
+ * @brief Contagem regressiva 1 linha/s na fase CONFIG (antes do timeout).
+ */
+void tickConfigListenCountdown(unsigned long slaveBootMs) {
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+    if (channelSyncCompleted || lastMasterRxMs != 0) {
+        return;
+    }
+    const unsigned long elapsed = millis() - slaveBootMs;
+    if (elapsed >= ESPNOW_CONFIG_LISTEN_MS) {
+        return;
+    }
+    static unsigned long lastWholeSec = ULONG_MAX;
+    const unsigned long wholeSec = elapsed / 1000UL;
+    if (wholeSec == lastWholeSec) {
+        return;
+    }
+    lastWholeSec = wholeSec;
+    const unsigned long remMs = ESPNOW_CONFIG_LISTEN_MS - elapsed;
+    const unsigned long remSec = (remMs + 999UL) / 1000UL;
+    Serial.printf("[CONFIG] ch%u — faltam %lus (aguardando Master)\n",
+                  ESPNOW_CONFIG_CHANNEL, remSec);
+#endif
+}
+
+/**
  * @brief Re-discovery só se nunca houve lock. Canal locked: só re-add + ping.
  */
 void performRediscoveryIfNeeded() {
@@ -2168,8 +2202,39 @@ void performRediscoveryIfNeeded() {
     const bool locked = multiChannelDiscovery && multiChannelDiscovery->isMasterChannelLocked();
     const uint8_t nvsCh = multiChannelDiscovery ? multiChannelDiscovery->getCache().lastChannel : 0;
     const uint8_t curCh = multiChannelDiscovery ? multiChannelDiscovery->getCurrentChannel() : 0;
-    const bool stayOnNvs = (nvsCh >= 2 && nvsCh <= 13 && curCh == nvsCh);
     const unsigned long rxAge = (lastMasterRxMs == 0) ? 0 : (millis() - lastMasterRxMs);
+
+#if ESPNOW_FIXED_CHANNEL_ENABLED
+    static bool configFallbackDone = false;
+    if (!configFallbackDone && !channelSyncCompleted && lastMasterRxMs == 0 &&
+        (millis() - slaveBootMs) > ESPNOW_CONFIG_LISTEN_MS &&
+        curCh == ESPNOW_CONFIG_CHANNEL && espNowBridge) {
+        configFallbackDone = true;
+        const uint8_t opTry = (nvsCh >= 1 && nvsCh <= 13 && nvsCh != ESPNOW_CONFIG_CHANNEL)
+            ? nvsCh : ESPNOW_CHANNEL;
+        Serial.printf("[CHANNEL] CONFIG timeout — unlock, try op ch %u\n", opTry);
+        if (multiChannelDiscovery) {
+            multiChannelDiscovery->lockMasterChannel(false);
+        }
+        if (espNowBridge->syncRadioChannel(opTry)) {
+            masterChannel = opTry;
+            if (multiChannelDiscovery) {
+                multiChannelDiscovery->setCurrentChannel(opTry);
+            }
+        }
+        if (espNowBridge->getESPNowController()) {
+            espNowBridge->getESPNowController()->setDiscoverySuppressed(false);
+        }
+        softReaddAndPingMaster();
+        lastSoftReaddMs = millis();
+        return;
+    }
+#endif
+
+    const bool configProvisioning =
+        (curCh == ESPNOW_CONFIG_CHANNEL && !channelSyncCompleted && lastMasterRxMs == 0);
+    const bool stayOnNvs = !configProvisioning &&
+        (nvsCh >= 2 && nvsCh <= 13 && curCh == nvsCh);
 
     if (channelSyncCompleted && masterConnected && !watchdog.isSafetyMode() && locked) {
         return;

@@ -61,16 +61,28 @@
 #define ESPNOW_CHANNEL 1                    // Canal WiFi (1-13) — fallback se fixo desligado
 #endif
 
+/** Marco cero: canal fixo de provisioning (deve coincidir com master) */
+#ifndef ESPNOW_CONFIG_CHANNEL
+#define ESPNOW_CONFIG_CHANNEL 11
+#endif
+
 /** Bancada / dev: canal RF fixo (sem scan 1–13). Produção multi-router: =0 */
 #ifndef ESPNOW_FIXED_CHANNEL_ENABLED
-#define ESPNOW_FIXED_CHANNEL_ENABLED 0
+#define ESPNOW_FIXED_CHANNEL_ENABLED 1
 #endif
 #ifndef ESPNOW_FIXED_CHANNEL
-#define ESPNOW_FIXED_CHANNEL 11             // Deve coincidir com canal WiFi do master (STA)
+#define ESPNOW_FIXED_CHANNEL ESPNOW_CONFIG_CHANNEL
 #endif
 /** Escuta passiva no canal fixo (ms) — muito menor que MCD_PASSIVE_LISTEN_MS */
 #ifndef ESPNOW_FIXED_PASSIVE_MS
 #define ESPNOW_FIXED_PASSIVE_MS 10000
+#endif
+/** Tempo em canal CONFIG sem RX do Master antes de tentar canal operacional */
+#ifndef ESPNOW_CONFIG_LISTEN_MS
+#define ESPNOW_CONFIG_LISTEN_MS 30000UL
+#endif
+#ifndef ESPNOW_LINK_VERBOSE
+#define ESPNOW_LINK_VERBOSE 0
 #endif
 
 #define MAX_ESPNOW_PEERS 10                 // Máximo de peers ESP-NOW

@@ -36,7 +36,8 @@ enum class MessageType : uint8_t {
     CONNECTIVITY_CHECK = 0x0C,  // Verificação de conectividade
     CONNECTIVITY_REPORT = 0x0D, // Relatório de conectividade
     ALL_RELAYS_STATUS = 0x0E,   // Slave → Master: estado real dos 8 relés
-    SET_RELAY_MASK = 0x0F       // Master → slave: máscara 8 bits atómica (bit i = relé i, 1 = ON)
+    SET_RELAY_MASK = 0x0F,      // Master → slave: máscara 8 bits atómica (bit i = relé i, 1 = ON)
+    CHANNEL_CHANGE = 0x10       // Master → slave: novo canal operativo
 };
 
 /**

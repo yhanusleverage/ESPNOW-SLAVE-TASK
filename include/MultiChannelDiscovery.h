@@ -212,6 +212,7 @@ public:
      * @return Canal ESP-NOW atual (1-13)
      */
     uint8_t getCurrentChannel() const { return currentChannel; }
+    void setCurrentChannel(uint8_t channel) { currentChannel = channel; }
     
     /**
      * @brief Verifica se Master foi encontrado
