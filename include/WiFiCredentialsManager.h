@@ -129,31 +129,34 @@ public:
      * @brief Salva credenciais na NVS
      */
     bool saveCredentials(const WiFiCredentialsData& creds) {
-        // Tentar abrir namespace para escrita
         if (!prefs.begin(NAMESPACE, false)) {
             Serial.println("❌ Erro: Não foi possível abrir NVS para salvar credenciais");
-            Serial.println("💡 Possíveis causas:");
-            Serial.println("   - Partição NVS não encontrada");
-            Serial.println("   - Memória flash corrompida");
             return false;
         }
-        
-        bool success = true;
-        success &= prefs.putString("ssid", creds.ssid);
-        success &= prefs.putString("password", creds.password);
-        success &= prefs.putUChar("channel", creds.channel);
-        
+
+        // Regrava limpa (putString às vezes falha com chave residual / NVS cheia)
+        prefs.remove("ssid");
+        prefs.remove("password");
+        prefs.remove("channel");
+
+        const size_t nSsid = prefs.putString("ssid", creds.ssid);
+        const size_t nPass = prefs.putString("password", creds.password);
+        const size_t nCh = prefs.putUChar("channel", creds.channel);
         prefs.end();
-        
-        if (success) {
+
+        // putString retorna 0 se string vazia — senha vazia é válida; SSID não
+        const bool ok = (nSsid > 0) && (nCh > 0) &&
+                        (nPass > 0 || creds.password[0] == '\0');
+
+        if (ok) {
             Serial.println("💾 Credenciais WiFi salvas na NVS");
             Serial.println("   SSID: " + String(creds.ssid));
             Serial.println("   Canal: " + String(creds.channel));
         } else {
-            Serial.println("❌ Erro ao salvar credenciais na NVS");
+            Serial.printf("❌ Erro ao salvar credenciais na NVS (ssid=%u pass=%u ch=%u)\n",
+                          (unsigned)nSsid, (unsigned)nPass, (unsigned)nCh);
         }
-        
-        return success;
+        return ok;
     }
     
     /**
@@ -161,8 +164,11 @@ public:
      */
     bool saveCredentials(const String& ssid, const String& password, uint8_t channel = 0) {
         WiFiCredentialsData creds;
+        memset(&creds, 0, sizeof(creds));
         strncpy(creds.ssid, ssid.c_str(), sizeof(creds.ssid) - 1);
+        creds.ssid[sizeof(creds.ssid) - 1] = '\0';
         strncpy(creds.password, password.c_str(), sizeof(creds.password) - 1);
+        creds.password[sizeof(creds.password) - 1] = '\0';
         creds.channel = channel;
         return saveCredentials(creds);
     }

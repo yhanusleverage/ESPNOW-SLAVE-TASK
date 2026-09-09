@@ -19,6 +19,7 @@
 #include <vector>
 #include <functional>
 #include <Preferences.h>
+#include "Config.h"
 #include "ESPNowController.h"
 #include "WiFiCredentialsManager.h"
 
@@ -417,14 +418,23 @@ private:
     
     void handleInit() {
         Serial.println("🔄 Inicializando sistema automático...");
+#if defined(SLAVE_MODE) && !SLAVE_JOIN_WIFI_AP
+        // Slave RelayBox: WIFI_STA já ativo para ESP-NOW — não esperar AP
+        changeState(CommState::ESPNOW_INIT);
+#else
         if (WiFi.isConnected()) {
             changeState(CommState::ESPNOW_INIT);
         } else {
             changeState(CommState::WIFI_CONNECTING);
         }
+#endif
     }
     
     void handleWiFiConnecting() {
+#if defined(SLAVE_MODE) && !SLAVE_JOIN_WIFI_AP
+        changeState(CommState::ESPNOW_INIT);
+        return;
+#endif
         if (WiFi.isConnected()) {
             Serial.println("✅ WiFi conectado");
             changeState(CommState::ESPNOW_INIT);

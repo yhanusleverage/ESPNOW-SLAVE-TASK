@@ -225,7 +225,7 @@ public:
 
 private:
     static const int RELAY_COUNT = 8;           // Número de relés do PCF8574
-    static const int DEFAULT_MAX_DURATION = 3600; // Duração máxima padrão (1 hora)
+    // Sem DEFAULT_MAX_DURATION: duration==0 permanente; >0 = valor do comando.
     
     PCF8574* pcf8574;                        // Ponteiro para PCF8574 (como no teste do usuário)
     uint8_t i2cAddress;                       // Endereço I2C do PCF8574

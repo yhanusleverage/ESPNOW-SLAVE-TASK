@@ -121,7 +121,12 @@ void ESPNowController::update() {
     }
 
     static unsigned long lastDiscovery = 0;
+    // ESP-NOW only: intervalo estável (não acelerar por !WiFi.isConnected)
+#if defined(SLAVE_MODE) && !SLAVE_JOIN_WIFI_AP
+    const unsigned long interval = 30000UL;
+#else
     const unsigned long interval = WiFi.isConnected() ? 30000UL : 10000UL;
+#endif
     if (millis() - lastDiscovery > interval) {
         if (!WiFi.isConnected()) {
             Serial.println("📡 [SLAVE] Re-anunciando presença (provisioning)...");
@@ -316,11 +321,34 @@ bool ESPNowController::syncRadioChannel(uint8_t channel) {
     wifiChannel = channel;
     esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
+        // STA a conectar/scanear bloqueia set_channel — pausar e retry
+        WiFi.disconnect(false);
+        delay(80);
+        err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    }
+    if (err != ESP_OK) {
         Serial.println("❌ syncRadioChannel falhou: " + String(err));
         return false;
     }
-    delay(50);
+    delay(40);
     return ensureBroadcastPeer();
+}
+
+/** Após hop: garantir peer Master no canal atual */
+bool ESPNowController::rebindPeerOnCurrentChannel(const uint8_t* mac, const String& name) {
+    if (!initialized || !mac) return false;
+    uint8_t ch = getCurrentRadioChannel();
+    if (ch < 1 || ch > 13) {
+        ch = wifiChannel;
+    }
+    return addPeerWithChannel(mac, ch, name.length() ? name : String("Master"));
+}
+
+uint8_t ESPNowController::getCurrentRadioChannel() const {
+    wifi_second_chan_t secondChan;
+    uint8_t ch = 0;
+    esp_wifi_get_channel(&ch, &secondChan);
+    return ch;
 }
 
 bool ESPNowController::ensureBroadcastPeer() {
@@ -1009,6 +1037,9 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                     Serial.println("   SSID: " + String(creds.ssid));
                     Serial.println("   Canal: " + String(creds.channel));
                     Serial.println("   Checksum: 0x" + String(creds.checksum, HEX));
+
+                    // ACK no ch CONFIG ANTES do callback saltar ao canal op
+                    sendWifiCredentialsAck(senderMac, creds.channel, 1);
                     
                     // Chamar callback para processar credenciais
                     wifiCredentialsCallback(String(creds.ssid), String(creds.password), creds.channel);
@@ -1016,6 +1047,11 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                     Serial.println("❌ Credenciais WiFi inválidas (checksum falhou)");
                 }
             }
+            break;
+        }
+
+        case MessageType::WIFI_CREDENTIALS_ACK: {
+            // Slave normalmente não recebe; ignore
             break;
         }
         
@@ -1337,6 +1373,60 @@ bool ESPNowController::validateWiFiCredentials(const WiFiCredentialsData& creden
     Serial.println("   SSID: " + String(credentials.ssid));
     Serial.println("   Canal: " + String(credentials.channel));
     return true;
+}
+
+namespace {
+volatile bool s_wifiCredsAckFlag = false;
+volatile uint8_t s_wifiCredsAckOp = 0;
+}
+
+void ESPNowController::clearWifiCredentialsAckFlag() {
+    s_wifiCredsAckFlag = false;
+    s_wifiCredsAckOp = 0;
+}
+
+bool ESPNowController::takeWifiCredentialsAckFlag() {
+    if (!s_wifiCredsAckFlag) {
+        return false;
+    }
+    s_wifiCredsAckFlag = false;
+    return true;
+}
+
+void ESPNowController::noteWifiCredentialsAck(uint8_t opChannel) {
+    s_wifiCredsAckOp = opChannel;
+    s_wifiCredsAckFlag = true;
+}
+
+bool ESPNowController::sendWifiCredentialsAck(const uint8_t* masterMac, uint8_t opChannel, uint8_t status) {
+    if (!initialized || !masterMac) {
+        return false;
+    }
+    addPeerSafe(masterMac, "Master-creds");
+
+    ESPNowMessage message = {};
+    message.type = MessageType::WIFI_CREDENTIALS_ACK;
+    WiFi.macAddress(message.senderId);
+    memcpy(message.targetId, masterMac, 6);
+    message.messageId = ++messageCounter;
+    message.timestamp = millis();
+    uint8_t payload[2] = { opChannel, status };
+    message.dataSize = 2;
+    memcpy(message.data, payload, 2);
+    message.checksum = calculateChecksum(message);
+
+    bool ok = false;
+    for (int i = 0; i < 3; ++i) {
+        if (sendMessage(message, masterMac)) {
+            ok = true;
+        }
+        delay(40);
+    }
+    Serial.printf("[CREDS-ACK] → master op=%u status=%u ok=%d\n",
+                  static_cast<unsigned>(opChannel),
+                  static_cast<unsigned>(status),
+                  ok ? 1 : 0);
+    return ok;
 }
 
 // Mantido para uso em handshakes (não usado para credenciais WiFi)

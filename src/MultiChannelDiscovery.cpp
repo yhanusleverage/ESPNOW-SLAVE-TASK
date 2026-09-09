@@ -282,16 +282,25 @@ DiscoveryResult MultiChannelDiscovery::discoverFixedChannelOnly() {
     if (passiveListen(ch, ESPNOW_FIXED_PASSIVE_MS)) {
         Serial.println("✅ Master encontrado no canal fixo");
         updateStats(true, ESPNOW_FIXED_PASSIVE_MS, ch);
-        persistKnownMasterChannel(ch);
-        lockMasterChannel(true);
+        // CONFIG: não lock/NVS op — permite fallback + creds
+        if (ch != ESPNOW_CONFIG_CHANNEL) {
+            persistKnownMasterChannel(ch);
+            lockMasterChannel(true);
+        } else {
+            persistKnownMasterChannel(ch);
+        }
         return DiscoveryResult::SUCCESS;
     }
 
     if (tryChannel(ch, 2000)) {
         Serial.println("✅ Master encontrado (tryChannel canal fixo)");
         updateStats(true, ESPNOW_FIXED_PASSIVE_MS + 2000, ch);
-        persistKnownMasterChannel(ch);
-        lockMasterChannel(true);
+        if (ch != ESPNOW_CONFIG_CHANNEL) {
+            persistKnownMasterChannel(ch);
+            lockMasterChannel(true);
+        } else {
+            persistKnownMasterChannel(ch);
+        }
         return DiscoveryResult::SUCCESS;
     }
 
@@ -414,8 +423,13 @@ void MultiChannelDiscovery::persistKnownMasterChannel(uint8_t channel) {
     if (channel < MCD_MIN_CHANNEL || channel > MCD_MAX_CHANNEL) {
         return;
     }
-    cache.lastChannel = channel;
     currentChannel = channel;
+    // CONFIG (ch11) = rendezvous; não gravar como canal operacional NVS
+    if (channel == ESPNOW_CONFIG_CHANNEL) {
+        Serial.printf("[MCD] canal CONFIG %u — só RAM (não NVS op)\n", channel);
+        return;
+    }
+    cache.lastChannel = channel;
     cache.usageCount++;
     cache.successRate = min(100, (int)cache.successRate + 10);
     if (MCD_CACHE_ENABLED) {
@@ -847,17 +861,21 @@ void MultiChannelDiscovery::handleReceivedMessage(const uint8_t* mac, const uint
         // 🚨 CRÍTICO: Atualizar currentChannel para o canal REAL
         currentChannel = canalReal;
         
-        // 🚨 CRÍTICO: Salvar no cache IMEDIATAMENTE
-        cache.lastChannel = canalReal;
-        cache.lastSuccess = millis();
-        cache.usageCount++;
-        cache.successRate = min(100, cache.successRate + 20);
-        saveCache();
-        
-        Serial.println("💾 Canal salvo no cache: " + String(canalReal));
-        Serial.println("✅ Discovery completo!");
-        Serial.println("================================\n");
-        
+        // CONFIG = rendezvous — não gravar NVS como canal op
+        if (canalReal == ESPNOW_CONFIG_CHANNEL) {
+            Serial.println("💾 Canal CONFIG — não salvar como op NVS");
+            Serial.println("✅ Discovery CONFIG completo (aguardando creds)!");
+            Serial.println("================================\n");
+        } else {
+            cache.lastChannel = canalReal;
+            cache.lastSuccess = millis();
+            cache.usageCount++;
+            cache.successRate = min(100, cache.successRate + 20);
+            saveCache();
+            Serial.println("💾 Canal salvo no cache: " + String(canalReal));
+            Serial.println("✅ Discovery completo!");
+            Serial.println("================================\n");
+        }        
         // 🚨 PROTEÇÃO: Callback com throttle (evitar chamadas excessivas)
         // Só chamar callback se:
         // 1. Passou tempo suficiente desde última chamada (throttle)

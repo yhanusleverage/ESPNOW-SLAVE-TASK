@@ -217,7 +217,9 @@ if (watchdog.isSafetyMode()) {
 
 **Comandos serial:** `watchdog_status`, `system_health`, `watchdog_reset`
 
-**Limites por relé:** `RELAY_CONFIGS` em `DataTypes.h` — `maxDuration` e `safetyLock` aplicados em `RelayCommandBox`.
+**Corte de relé:** só o **timer do comando** (`durationSec` / `hasTimer`). `RELAY_CONFIGS` em `DataTypes.h` são placeholders — sem `maxDuration`/`safetyLock` em runtime.
+
+**WiFi no Slave:** `SLAVE_JOIN_WIFI_AP=0` (default) — creds do Master só para **hop ao canal op**; sem `WiFi.begin` / reconnect periódico (evita scan → 0x3066). `WIFI_STA` permanece para ESP-NOW. Serial `wifi_connect` ainda permite join manual.
 
 ### 🔌 Relé Watchdog Externo (produção agro)
 

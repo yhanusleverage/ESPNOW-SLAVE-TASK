@@ -78,11 +78,24 @@
 #define ESPNOW_FIXED_PASSIVE_MS 10000
 #endif
 /** Tempo em canal CONFIG sem RX do Master antes de tentar canal operacional */
+/** Tempo sem RX do Master no canal op → voltar ao CONFIG (ch11) */
+#ifndef ESPNOW_MASTER_LOST_RETURN_CONFIG_MS
+#define ESPNOW_MASTER_LOST_RETURN_CONFIG_MS 90000UL
+#endif
 #ifndef ESPNOW_CONFIG_LISTEN_MS
 #define ESPNOW_CONFIG_LISTEN_MS 30000UL
 #endif
 #ifndef ESPNOW_LINK_VERBOSE
 #define ESPNOW_LINK_VERBOSE 0
+#endif
+
+/**
+ * Slave RelayBox: 0 = não junta ao AP (só WIFI_STA + canal ESP-NOW).
+ * Creds do Master usam-se para hop ao canal op; SSID/pass opcionais (serial wifi_connect).
+ * 1 = comportamento legado (WiFi.begin + reconnect periódico — pode mover canal / 0x3066).
+ */
+#ifndef SLAVE_JOIN_WIFI_AP
+#define SLAVE_JOIN_WIFI_AP 0
 #endif
 
 #define MAX_ESPNOW_PEERS 10                 // Máximo de peers ESP-NOW
@@ -167,6 +180,8 @@
 // ===== LIMITES DE SENSORES =====
 #define MIN_PH 0.0
 #define MAX_PH 14.0
+#define MIN_EC 0.0
+#define MAX_EC 5000.0
 #define MIN_TDS 0.0
 #define MAX_TDS 5000.0
 #define MIN_TEMP 0.0

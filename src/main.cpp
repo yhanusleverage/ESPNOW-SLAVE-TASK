@@ -241,7 +241,8 @@ void setup() {
         ChannelCache cache = multiChannelDiscovery->getCache();
 #if ESPNOW_FIXED_CHANNEL_ENABLED
         if (cache.lastChannel >= 1 && cache.lastChannel <= 13 &&
-            cache.lastChannel != ESPNOW_CONFIG_CHANNEL) {
+            cache.lastChannel != ESPNOW_CONFIG_CHANNEL &&
+            cache.lastChannel != static_cast<uint8_t>(ESPNOW_CHANNEL)) {
             masterChannel = cache.lastChannel;
             Serial.printf("📦 Boot operacional NVS ch %u (skip CONFIG)\n", masterChannel);
         } else {
@@ -490,18 +491,20 @@ void loop() {
         }
     }
     
-    // 4. Verificar WiFi periodicamente
+    // 4. Verificar WiFi periodicamente (só se SLAVE_JOIN_WIFI_AP)
+#if SLAVE_JOIN_WIFI_AP
     if (watchdog.shouldCheckWiFi()) {
         if (!WiFi.isConnected()) {
-            // Só tentar reconectar se tiver credenciais salvas
-            // Evitar erros de NVS quando não há credenciais
             if (wifiManager.hasCredentials()) {
                 Serial.println("📶 WiFi desconectado - tentando reconectar...");
                 wifiManager.connectWithSavedCredentials();
             }
-            // Se não tem credenciais, apenas silenciar (Master enviará)
         }
     }
+#else
+    // ESP-NOW only: não WiFi.begin periódico (scan muda canal → 0x3066)
+    (void)0;
+#endif
     
     // 5. MODO SEGURO: aviso periódico (relés já desligados imediatamente)
     if (watchdog.isSafetyMode()) {
@@ -1197,9 +1200,9 @@ void printHelp() {
 // Buffer para acumular comando
 static String commandBuffer = "";
 
-// Função para processar credenciais WiFi recebidas via ESP-NOW
+// Credenciais via payload cru (raro; path principal = Bridge WIFI_CREDENTIALS)
 void processWiFiCredentials(const uint8_t* data, int len) {
-    Serial.println("\n📥 Credenciais WiFi recebidas via ESP-NOW!");
+    Serial.println("\n📥 Credenciais (canal op) recebidas via ESP-NOW!");
     
     if (len != sizeof(WiFiCredentialsData)) {
         Serial.println("❌ Tamanho de credenciais inválido");
@@ -1210,86 +1213,52 @@ void processWiFiCredentials(const uint8_t* data, int len) {
     
     WiFiCredentialsData* creds = (WiFiCredentialsData*)data;
     
-    // Validar credenciais usando o novo protocolo
     ESPNowController tempController("temp", 1);
     if (!tempController.validateWiFiCredentials(*creds)) {
         Serial.println("❌ Credenciais inválidas - validação falhou");
         return;
     }
     
-    Serial.println("✅ Credenciais validadas com sucesso!");
-    Serial.println("   SSID: " + String(creds->ssid));
-    Serial.print("   Senha: ");
-    for (size_t i = 0; i < strlen(creds->password); i++) Serial.print("*");
-    Serial.println();
-    Serial.println("   Canal: " + String(creds->channel));
-    Serial.println("   Checksum: 0x" + String(creds->checksum, HEX));
+    const uint8_t newChannel = creds->channel;
+    Serial.println("✅ Credenciais validadas!");
+    Serial.println("   Canal op: " + String(newChannel));
     
-    // Salvar credenciais
-    if (wifiManager.saveCredentials(creds->ssid, creds->password, creds->channel)) {
-        Serial.println("💾 Credenciais salvas com sucesso!");
-        
-        // Conectar ao WiFi
-        Serial.println("🔄 Conectando ao WiFi...");
-        uint8_t newChannel = creds->channel;  // Canal recebido nas credenciais
-        
-        if (wifiManager.connectToWiFi(creds->ssid, creds->password)) {
-            Serial.println("✅ WiFi conectado!");
-            newChannel = WiFi.channel();  // Usar canal do WiFi conectado
-            Serial.println("📶 Canal WiFi conectado: " + String(newChannel));
-        } else {
-            Serial.println("❌ Falha ao conectar ao WiFi");
-            Serial.println("💡 Verifique se o roteador está acessível");
-            Serial.println("🔄 Sincronizando canal ESP-NOW mesmo sem WiFi...");
-            Serial.println("📶 Usando canal recebido: " + String(newChannel));
-        }
-        
-        // ===== CRÍTICO: Sempre reiniciar ESP-NOW no canal correto =====
-        Serial.println("🔄 Reiniciando ESP-NOW no canal " + String(newChannel) + "...");
-        
+    wifiManager.saveCredentials(creds->ssid, creds->password, newChannel);
+
+    if (newChannel >= 1 && newChannel <= 13 && newChannel != ESPNOW_CONFIG_CHANNEL) {
+        WiFi.disconnect(false);
+        delay(50);
         if (espNowBridge) {
-            espNowBridge->end();  // Finalizar antes de deletar
-            delete espNowBridge;
-            espNowBridge = nullptr;
-        }
-        
-        // Pequeno delay para garantir limpeza
-        delay(500);
-        
-        // Criar nova instância ESP-NOW no canal correto
-        espNowBridge = new ESPNowBridge(&relayBox, newChannel);
-        if (espNowBridge->begin()) {
-            Serial.println("✅ ESP-NOW reiniciado com sucesso!");
-            Serial.println("📶 Novo canal: " + String(newChannel));
-            
-            // ===== FLUXO COMPLETO: DESCOBERTA E COMUNICAÇÃO BIDIRECIONAL =====
-            Serial.println("\n🔗 === ESTABELECENDO COMUNICAÇÃO BIDIRECIONAL ===");
-            
-            // 1. Enviar broadcast de discovery inicial
-            Serial.println("📢 1/3: Enviando broadcast de discovery para Master...");
-            espNowBridge->sendDiscoveryBroadcast();
-            delay(500);
-            
-            // 2. Adicionar Master como peer (MAC recebido nas credenciais)
-            // Assumir que o MAC do Master é conhecido ou será recebido via discovery
-            Serial.println("🔗 2/3: Adicionando Master como peer...");
-            
-            // TODO: Pegar MAC do Master (pode ser salvo ou recebido)
-            // Por ora, vamos adicionar no próximo discovery response
-            
-            // 3. Reenviar discovery após sync
-            Serial.println("📢 3/3: Reenviando discovery para sincronização...");
-            espNowBridge->sendDiscoveryBroadcast();
-            
-            Serial.println("✅ Processo de sincronização iniciado!");
-            Serial.println("⏳ Aguardando Master encontrar este Slave...");
-            Serial.println("==========================================\n");
+            espNowBridge->syncRadioChannel(newChannel);
+            if (espNowBridge->getESPNowController()) {
+                espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
+            }
         } else {
-            Serial.println("❌ Erro ao reiniciar ESP-NOW");
+            esp_wifi_set_channel(newChannel, WIFI_SECOND_CHAN_NONE);
+        }
+        channelSyncCompleted = true;
+        masterChannel = newChannel;
+        masterConnected = true;
+        if (multiChannelDiscovery) {
+            multiChannelDiscovery->persistKnownMasterChannel(newChannel);
+            multiChannelDiscovery->lockMasterChannel(true);
+        }
+        Serial.printf("[CHANNEL] hop op=%u (raw creds, ESP-NOW only)\n", newChannel);
+    }
+
+#if SLAVE_JOIN_WIFI_AP
+    if (wifiManager.connectToWiFi(creds->ssid, creds->password)) {
+        Serial.println("✅ WiFi conectado!");
+        uint8_t wifiCh = WiFi.channel();
+        if (espNowBridge) {
+            espNowBridge->syncRadioChannel(wifiCh);
         }
     } else {
-        Serial.println("❌ Erro ao salvar credenciais");
+        Serial.println("❌ Falha WiFi — canal op já aplicado");
     }
+#else
+    Serial.println("[CREDS] ESP-NOW only — sem WiFi.begin (SLAVE_JOIN_WIFI_AP=0)");
+#endif
 }
 
 // Função para detectar o canal do MASTER automaticamente
@@ -1882,6 +1851,10 @@ void attemptMasterReconnection() {
  * @brief Verifica qualidade do sinal WiFi
  */
 void checkSignalQuality() {
+#if !SLAVE_JOIN_WIFI_AP
+    // Slave RelayBox: sem STA AP — RSSI WiFi irrelevante
+    return;
+#else
     if (!WiFi.isConnected()) {
         Serial.println("⚠️ WiFi desconectado - tentando reconectar...");
         if (wifiManager.hasCredentials()) {
@@ -1904,6 +1877,7 @@ void checkSignalQuality() {
             }
         }
     }
+#endif
 }
 
 /**
@@ -1926,6 +1900,7 @@ void implementFallbackStrategy() {
 
     Serial.println("🔄 Implementando estratégia de fallback...");
     
+#if SLAVE_JOIN_WIFI_AP
     // 1. Tentar reconectar WiFi
     Serial.println("   📶 Tentando reconectar WiFi...");
     if (wifiManager.hasCredentials()) {
@@ -1935,6 +1910,9 @@ void implementFallbackStrategy() {
             Serial.println("   ❌ Falha ao reconectar WiFi");
         }
     }
+#else
+    Serial.println("   ⊘ WiFi AP skip (ESP-NOW only)");
+#endif
     
     // 2. Tentar detectar canal MASTER novamente
     Serial.println("   🔍 Tentando detectar canal MASTER...");
@@ -1983,22 +1961,31 @@ void automaticSlaveDecisions() {
 void checkSlaveCommunicationIntegrity() {
     Serial.println("🔍 Verificação de integridade da comunicação SLAVE...");
     
+#if SLAVE_JOIN_WIFI_AP
     bool wifiOk = WiFi.isConnected();
+#else
+    bool wifiOk = true;  // ESP-NOW only: WiFi AP não é requisito
+#endif
     bool espNowOk = (espNowBridge != nullptr);
     bool masterOk = masterConnected;
     
     Serial.println("📊 Status da comunicação:");
+#if SLAVE_JOIN_WIFI_AP
     Serial.println("   WiFi: " + String(wifiOk ? "✅ Conectado" : "❌ Desconectado"));
+#else
+    Serial.println("   WiFi AP: ⊘ não usado (ESP-NOW only)");
+#endif
     Serial.println("   ESP-NOW: " + String(espNowOk ? "✅ Ativo" : "❌ Inativo"));
     Serial.println("   MASTER: " + String(masterOk ? "✅ Conectado" : "❌ Desconectado"));
     
-    // Decisão automática baseada na integridade
+#if SLAVE_JOIN_WIFI_AP
     if (!wifiOk) {
         Serial.println("🚨 WiFi desconectado - tentando reconectar...");
         if (wifiManager.hasCredentials()) {
             wifiManager.connectWithSavedCredentials();
         }
     }
+#endif
     
     if (!masterOk) {
         Serial.println("🚨 MASTER desconectado - tentando reconectar...");
@@ -2108,12 +2095,21 @@ void onMasterFound(uint8_t channel, const uint8_t* masterMac) {
                 masterMac, "RelayBox", 8, true, millis(), ESP.getFreeHeap());
         }
     }
-    
-    channelSyncCompleted = true;
+
+    // ch11 = CONFIG (encontro). Sync operacional só com creds/op (≠11).
     masterConnected = true;
     failedPingCount = 0;
     masterChannel = channel;
+    if (channel == ESPNOW_CONFIG_CHANNEL) {
+        channelSyncCompleted = false;
+        Serial.println("📌 Master no CONFIG — aguardando creds/op (sem sync final)");
+        if (multiChannelDiscovery) {
+            multiChannelDiscovery->persistKnownMasterChannel(channel);  // RAM only
+        }
+        return;
+    }
 
+    channelSyncCompleted = true;
     if (multiChannelDiscovery) {
         multiChannelDiscovery->persistKnownMasterChannel(channel);
         multiChannelDiscovery->lockMasterChannel(true);
@@ -2205,8 +2201,37 @@ void performRediscoveryIfNeeded() {
     const unsigned long rxAge = (lastMasterRxMs == 0) ? 0 : (millis() - lastMasterRxMs);
 
 #if ESPNOW_FIXED_CHANNEL_ENABLED
+    // Master sumiu no canal op → voltar ao CONFIG para re-negociação
+    static unsigned long lastReturnConfigMs = 0;
+    if (channelSyncCompleted && lastMasterRxMs != 0 &&
+        rxAge > ESPNOW_MASTER_LOST_RETURN_CONFIG_MS &&
+        curCh != ESPNOW_CONFIG_CHANNEL && espNowBridge &&
+        (millis() - lastReturnConfigMs) > ESPNOW_MASTER_LOST_RETURN_CONFIG_MS) {
+        lastReturnConfigMs = millis();
+        Serial.printf("[CHANNEL] Master lost %lus — return CONFIG ch%u\n",
+                      rxAge / 1000UL, (unsigned)ESPNOW_CONFIG_CHANNEL);
+        if (multiChannelDiscovery) {
+            multiChannelDiscovery->lockMasterChannel(false);
+        }
+        channelSyncCompleted = false;
+        masterConnected = false;
+        WiFi.disconnect(false);
+        delay(50);
+        if (espNowBridge->syncRadioChannel(ESPNOW_CONFIG_CHANNEL)) {
+            masterChannel = ESPNOW_CONFIG_CHANNEL;
+            if (multiChannelDiscovery) {
+                multiChannelDiscovery->setCurrentChannel(ESPNOW_CONFIG_CHANNEL);
+            }
+        }
+        if (espNowBridge->getESPNowController()) {
+            espNowBridge->getESPNowController()->setDiscoverySuppressed(false);
+        }
+        return;
+    }
+
+    // REF: sair do CONFIG após listen mesmo se Master foi visto em ch11 (sem creds/op).
     static bool configFallbackDone = false;
-    if (!configFallbackDone && !channelSyncCompleted && lastMasterRxMs == 0 &&
+    if (!configFallbackDone && !channelSyncCompleted &&
         (millis() - slaveBootMs) > ESPNOW_CONFIG_LISTEN_MS &&
         curCh == ESPNOW_CONFIG_CHANNEL && espNowBridge) {
         configFallbackDone = true;

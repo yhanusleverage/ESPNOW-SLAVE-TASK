@@ -96,17 +96,13 @@ bool RelayCommandBox::begin() {
 }
 
 void RelayCommandBox::update() {
+    // Só timers/ciclos do comando — sem maxDuration fantasma em ON permanente
     checkTimers();
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        if (relayStates[i].isOn) {
-            enforceMaxDurationOnRelay(i);
-        }
-    }
 }
 
 uint32_t RelayCommandBox::getMaxDuration(int relayNumber) const {
-    if (!isValidRelayNumber(relayNumber)) return DEFAULT_MAX_DURATION;
-    return relayStates[relayNumber].config.maxDuration;
+    (void)relayNumber;
+    return 0;  // sem limite inventado
 }
 
 void RelayCommandBox::clearSchedule(int relayNumber) {
@@ -134,19 +130,8 @@ bool RelayCommandBox::commitRelayHardware(int relayNumber, bool on) {
 }
 
 bool RelayCommandBox::enforceMaxDurationOnRelay(int relayNumber) {
-    if (!relayStates[relayNumber].isOn) return false;
-    if (relayStates[relayNumber].inCycle) return false;
-
-    unsigned long elapsed = (millis() - relayStates[relayNumber].startTime) / 1000;
-    uint32_t maxDur = getMaxDuration(relayNumber);
-
-    if (elapsed >= maxDur) {
-        String relayName = relayStates[relayNumber].name.isEmpty() ?
-                          "Relé " + String(relayNumber) : relayStates[relayNumber].name;
-        Serial.println("⏰ maxDuration (" + String(maxDur) + "s) atingido — desligando " + relayName);
-        return setRelay(relayNumber, false);
-    }
-    return false;
+    (void)relayNumber;
+    return false;  // duration==0 é permanente; não inventar OFF
 }
 
 bool RelayCommandBox::setRelay(int relayNumber, bool state) {
@@ -158,12 +143,6 @@ bool RelayCommandBox::setRelay(int relayNumber, bool state) {
     if (state && safetyModeBlocked) {
         Serial.println("🚨 SafetyMode ATIVO — relé " + String(relayNumber) + " bloqueado");
         return false;
-    }
-
-    if (state && relayStates[relayNumber].config.safetyLock) {
-        uint32_t maxDur = getMaxDuration(relayNumber);
-        Serial.println("🔒 safetyLock: relé " + String(relayNumber) + " limitado a " + String(maxDur) + "s");
-        return setRelayWithTimer(relayNumber, true, maxDur);
     }
     
     if (!pcfInitialized) {
@@ -223,13 +202,7 @@ bool RelayCommandBox::setRelayWithTimer(int relayNumber, bool state, int seconds
 
     clearSchedule(relayNumber);
 
-    uint32_t maxDur = getMaxDuration(relayNumber);
-    if ((uint32_t)seconds > maxDur) {
-        Serial.println("⚠️ Duração limitada a " + String(maxDur) + "s (maxDuration)");
-        seconds = (int)maxDur;
-    }
-    
-    // Configurar estado com timer
+    // Timer = valor exacto del comando (sin techo 3600/86400)
     relayStates[relayNumber].isOn = state;
     relayStates[relayNumber].startTime = millis();
     relayStates[relayNumber].timerSeconds = seconds;
@@ -272,12 +245,6 @@ bool RelayCommandBox::startCycle(int relayNumber, uint32_t onSec, uint32_t offSe
     if (onSec < 1 || offSec < 1) {
         Serial.println("❌ Cycle requer onSec e offSec >= 1");
         return false;
-    }
-
-    uint32_t maxDur = getMaxDuration(relayNumber);
-    if (onSec > maxDur) {
-        Serial.println("⚠️ Cycle ON limitado a " + String(maxDur) + "s (maxDuration)");
-        onSec = maxDur;
     }
 
     clearSchedule(relayNumber);
@@ -430,13 +397,8 @@ bool RelayCommandBox::applyRelayMask(uint8_t mask, uint16_t durationSec) {
         relayStates[i].isOn = on;
         relayStates[i].startTime = millis();
         if (on && durationSec > 0) {
-            uint32_t seconds = durationSec;
-            uint32_t maxDur = getMaxDuration(i);
-            if (seconds > maxDur) {
-                seconds = maxDur;
-            }
             relayStates[i].hasTimer = true;
-            relayStates[i].timerSeconds = (int)seconds;
+            relayStates[i].timerSeconds = (int)durationSec;
         } else {
             relayStates[i].hasTimer = false;
             relayStates[i].timerSeconds = 0;
@@ -869,8 +831,6 @@ bool RelayCommandBox::applyPersistentStates(const PersistentRelayStateData& stat
             states.relays[i].cycleOffSec > 0) {
             uint32_t onSec = states.relays[i].cycleOnSec;
             uint32_t offSec = states.relays[i].cycleOffSec;
-            uint32_t maxDur = getMaxDuration(i);
-            if (onSec > maxDur) onSec = maxDur;
             bool phaseOn = states.relays[i].cyclePhaseOn != 0;
             uint32_t phaseSec = phaseOn ? onSec : offSec;
             uint32_t remaining = states.relays[i].timerEndTime;
@@ -892,7 +852,6 @@ bool RelayCommandBox::applyPersistentStates(const PersistentRelayStateData& stat
             }
         } else if (states.relays[i].hasTimer) {
             uint32_t remaining = states.relays[i].timerEndTime;
-            if (remaining > 86400) remaining = 0;
             if (remaining > 0 && states.relays[i].state == 1) {
                 Serial.println("⏰ Relé " + String(i) + ": timer " + String(remaining) + "s restantes");
                 setRelayWithTimer(i, true, remaining);

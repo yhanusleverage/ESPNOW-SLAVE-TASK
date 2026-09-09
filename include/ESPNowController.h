@@ -37,7 +37,8 @@ enum class MessageType : uint8_t {
     CONNECTIVITY_REPORT = 0x0D, // Relatório de conectividade
     ALL_RELAYS_STATUS = 0x0E,   // Slave → Master: estado real dos 8 relés
     SET_RELAY_MASK = 0x0F,      // Master → slave: máscara 8 bits atómica (bit i = relé i, 1 = ON)
-    CHANNEL_CHANGE = 0x10       // Master → slave: novo canal operativo
+    CHANNEL_CHANGE = 0x10,      // Master → slave: novo canal operativo
+    WIFI_CREDENTIALS_ACK = 0x12 // slave → Master: creds OK (ainda no ch CONFIG)
 };
 
 /**
@@ -57,7 +58,7 @@ struct ESPNowMessage {
 /**
  * Master → slave: um acto = 1 pacote.
  * mask bit i = relé i (1 = ON). PCF activo em LOW → write8(~mask).
- * durationSec 0 = permanente (maxDuration do relé ainda aplica no slave).
+ * durationSec 0 = permanente (sem maxDuration fantasma no slave).
  */
 struct RelayMaskCommandData {
     uint8_t mask;
@@ -230,6 +231,11 @@ public:
      * @brief Garante peer broadcast no canal atual
      */
     bool ensureBroadcastPeer();
+
+    /** Re-add peer no canal RF atual (após hop op) */
+    bool rebindPeerOnCurrentChannel(const uint8_t* mac, const String& name = "Master");
+
+    uint8_t getCurrentRadioChannel() const;
 
     /**
      * @brief ACK ligero por comando de relé (TASK_MSG_RELAY_ACK)
@@ -422,6 +428,12 @@ public:
      * @return true se credenciais são válidas
      */
     bool validateWiFiCredentials(const WiFiCredentialsData& credentials);
+
+    /** Provisioning handshake: ACK de creds ainda no ch CONFIG */
+    bool sendWifiCredentialsAck(const uint8_t* masterMac, uint8_t opChannel, uint8_t status = 1);
+    static void clearWifiCredentialsAckFlag();
+    static bool takeWifiCredentialsAckFlag();
+    static void noteWifiCredentialsAck(uint8_t opChannel);
     
     /**
      * @brief Inicia handshake bidirecional com dispositivo

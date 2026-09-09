@@ -2,9 +2,12 @@
 
 Documento único para el agente del **Master**. El firmware de este repo (SLAVE) ya está alineado. Si el Master usa otros opcodes o manda 8 `on` en bucle, choca con esto.
 
-**Fecha:** 2026-08-24  
+**Fecha:** 2026-08-24 (contrato opcodes) · actualizado enlace 2026-09-09  
 **Repo:** `ESPNOW-SLAVE-TASK-main`  
 **Rol del slave:** tonto — PCF + ACK honesto + máscara. **Cero** reglas, MQTT, Auto EC/pH, owners.
+
+> **Plan siguiente (radio + NVS + Master/Slave):**  
+> [`HANDOFF_RADIO_NVS_MASTER_SLAVE.md`](HANDOFF_RADIO_NVS_MASTER_SLAVE.md) — qué tocar en cada repo, orden y tests.
 
 ---
 
@@ -55,7 +58,7 @@ Payload `SET_RELAY_MASK` (packed, 8 bytes):
 struct RelayMaskCommandData {
     uint8_t  mask;         // bit i = relé i, 1 = ON
     uint8_t  pad;          // 0
-    uint16_t durationSec;  // 0 = permanente (slave aplica maxDuration)
+    uint16_t durationSec;  // 0 = permanente (só timer do comando; sem maxDuration)
     uint32_t commandId;
 };
 ```
