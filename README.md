@@ -221,6 +221,10 @@ if (watchdog.isSafetyMode()) {
 
 **WiFi no Slave:** `SLAVE_JOIN_WIFI_AP=0` (default) — creds do Master só para **hop ao canal op**; sem `WiFi.begin` / reconnect periódico (evita scan → 0x3066). `WIFI_STA` permanece para ESP-NOW. Serial `wifi_connect` ainda permite join manual.
 
+**Contrato ESP-NOW (validado — não regredir):** ver Master  
+`ESP-HIDROWAVE-main/docs/handoffs/espnow/HANDOFF_PROVISIONING_CREDS_STABLE.md`  
+(ch11→op, ACK-only, latch Master, duration=0 permanente, Slave sem AP).
+
 ### 🔌 Relé Watchdog Externo (produção agro)
 
 Para bombas críticas, use um **relé watchdog externo** alimentado por pulso GPIO do ESP32. Se o firmware travar e o pulso parar, o relé externo corta a alimentação das bombas (fail-safe elétrico).

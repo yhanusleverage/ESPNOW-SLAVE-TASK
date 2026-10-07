@@ -77,7 +77,7 @@
 #ifndef ESPNOW_FIXED_PASSIVE_MS
 #define ESPNOW_FIXED_PASSIVE_MS 10000
 #endif
-/** Tempo em canal CONFIG sem RX do Master antes de tentar canal operacional */
+/** Contagem no CONFIG. Sem creds o slave permanece no 11; não salta ao NVS. */
 /** Tempo sem RX do Master no canal op → voltar ao CONFIG (ch11) */
 #ifndef ESPNOW_MASTER_LOST_RETURN_CONFIG_MS
 #define ESPNOW_MASTER_LOST_RETURN_CONFIG_MS 90000UL

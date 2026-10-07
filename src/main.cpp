@@ -295,6 +295,9 @@ void setup() {
     }
     
     espNowBridge->syncRadioChannel(masterChannel);
+    if (multiChannelDiscovery) {
+        multiChannelDiscovery->setCurrentChannel(masterChannel);
+    }
 #if ESPNOW_FIXED_CHANNEL_ENABLED
     if (masterChannel == ESPNOW_CONFIG_CHANNEL) {
         Serial.printf("📌 Modo CONFIG ch %u — aguardando Master/creds (sem lock no boot)\n", masterChannel);
@@ -1244,6 +1247,19 @@ void processWiFiCredentials(const uint8_t* data, int len) {
             multiChannelDiscovery->lockMasterChannel(true);
         }
         Serial.printf("[CHANNEL] hop op=%u (raw creds, ESP-NOW only)\n", newChannel);
+    } else if (newChannel == ESPNOW_CONFIG_CHANNEL) {
+        channelSyncCompleted = true;
+        masterChannel = newChannel;
+        masterConnected = true;
+        if (multiChannelDiscovery) {
+            multiChannelDiscovery->setCurrentChannel(newChannel);
+            multiChannelDiscovery->discardStaleOpChannel();
+            multiChannelDiscovery->lockMasterChannel(true);
+        }
+        if (espNowBridge && espNowBridge->getESPNowController()) {
+            espNowBridge->getESPNowController()->setDiscoverySuppressed(true);
+        }
+        Serial.printf("[CHANNEL] creds canal %u — permanece (raw)\n", newChannel);
     }
 
 #if SLAVE_JOIN_WIFI_AP
@@ -2096,13 +2112,17 @@ void onMasterFound(uint8_t channel, const uint8_t* masterMac) {
         }
     }
 
-    // ch11 = CONFIG (encontro). Sync operacional só com creds/op (≠11).
+    // ch11 = encontro. O fecho é o pacote de creds (mesmo se o canal de trabalho for 11).
     masterConnected = true;
     failedPingCount = 0;
     masterChannel = channel;
     if (channel == ESPNOW_CONFIG_CHANNEL) {
+        if (channelSyncCompleted && multiChannelDiscovery &&
+            multiChannelDiscovery->isMasterChannelLocked()) {
+            return;
+        }
         channelSyncCompleted = false;
-        Serial.println("📌 Master no CONFIG — aguardando creds/op (sem sync final)");
+        Serial.println("📌 Master no CONFIG — aguardando creds (sem sync final)");
         if (multiChannelDiscovery) {
             multiChannelDiscovery->persistKnownMasterChannel(channel);  // RAM only
         }
@@ -2229,29 +2249,23 @@ void performRediscoveryIfNeeded() {
         return;
     }
 
-    // REF: sair do CONFIG após listen mesmo se Master foi visto em ch11 (sem creds/op).
-    static bool configFallbackDone = false;
-    if (!configFallbackDone && !channelSyncCompleted &&
-        (millis() - slaveBootMs) > ESPNOW_CONFIG_LISTEN_MS &&
-        curCh == ESPNOW_CONFIG_CHANNEL && espNowBridge) {
-        configFallbackDone = true;
-        const uint8_t opTry = (nvsCh >= 1 && nvsCh <= 13 && nvsCh != ESPNOW_CONFIG_CHANNEL)
-            ? nvsCh : ESPNOW_CHANNEL;
-        Serial.printf("[CHANNEL] CONFIG timeout — unlock, try op ch %u\n", opTry);
-        if (multiChannelDiscovery) {
-            multiChannelDiscovery->lockMasterChannel(false);
+    // Sem creds: ficar no 11. O NVS op (ex. canal 1) não manda até o Master o escrever.
+    uint8_t radioCh = 0;
+    wifi_second_chan_t radioSecond = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&radioCh, &radioSecond) != ESP_OK) {
+        radioCh = masterChannel;
+    }
+    if (!channelSyncCompleted && radioCh == ESPNOW_CONFIG_CHANNEL && espNowBridge) {
+        static bool loggedStay = false;
+        if (!loggedStay && (millis() - slaveBootMs) > ESPNOW_CONFIG_LISTEN_MS) {
+            loggedStay = true;
+            Serial.printf("[CHANNEL] CONFIG sem creds — permanece ch %u (NVS op %u ignorado)\n",
+                          static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL), nvsCh);
         }
-        if (espNowBridge->syncRadioChannel(opTry)) {
-            masterChannel = opTry;
-            if (multiChannelDiscovery) {
-                multiChannelDiscovery->setCurrentChannel(opTry);
-            }
+        if ((millis() - lastSoftReaddMs) > 15000UL) {
+            softReaddAndPingMaster();
+            lastSoftReaddMs = millis();
         }
-        if (espNowBridge->getESPNowController()) {
-            espNowBridge->getESPNowController()->setDiscoverySuppressed(false);
-        }
-        softReaddAndPingMaster();
-        lastSoftReaddMs = millis();
         return;
     }
 #endif

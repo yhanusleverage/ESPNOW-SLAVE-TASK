@@ -745,7 +745,11 @@ void ESPNowBridge::onWiFiCredentialsReceived(const String& ssid, const String& p
     }
 
     extern bool channelSyncCompleted;
+    extern bool masterConnected;
+    extern uint8_t masterChannel;
     channelSyncCompleted = true;
+    masterConnected = true;
+    masterChannel = channel;
 
     if (channel >= 1 && channel <= 13 && channel != ESPNOW_CONFIG_CHANNEL) {
         WiFi.disconnect(false);
@@ -753,11 +757,17 @@ void ESPNowBridge::onWiFiCredentialsReceived(const String& ssid, const String& p
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
         instance->wifiChannel = channel;
         Serial.printf("[CHANNEL] hop op=%u (callback, sem WiFi AP)\n", channel);
+    } else if (channel == ESPNOW_CONFIG_CHANNEL) {
+        Serial.printf("[CHANNEL] creds canal %u — permanece (callback)\n", channel);
     }
 
     extern MultiChannelDiscovery* multiChannelDiscovery;
     if (multiChannelDiscovery && channel != ESPNOW_CONFIG_CHANNEL) {
         multiChannelDiscovery->persistKnownMasterChannel(channel);
+        multiChannelDiscovery->lockMasterChannel(true);
+    } else if (multiChannelDiscovery && channel == ESPNOW_CONFIG_CHANNEL) {
+        multiChannelDiscovery->setCurrentChannel(channel);
+        multiChannelDiscovery->discardStaleOpChannel();
         multiChannelDiscovery->lockMasterChannel(true);
     }
     if (instance->espNowController) {
@@ -1211,9 +1221,10 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
 
                 const uint8_t opCh = creds.channel;
                 const bool opValid = (opCh >= 1 && opCh <= 13 && opCh != ESPNOW_CONFIG_CHANNEL);
+                const bool workIsConfig = (opCh == ESPNOW_CONFIG_CHANNEL);
 
                 // Já sincronizado no canal op: só ACK (não hop/WiFi)
-                if (channelSyncCompleted && opValid && masterChannel == opCh) {
+                if (channelSyncCompleted && (opValid || workIsConfig) && masterChannel == opCh) {
                     if (espNowController) {
                         espNowController->rebindPeerOnCurrentChannel(senderMac, "Master");
                         espNowController->sendWifiCredentialsAck(senderMac, opCh, 1);
@@ -1254,6 +1265,20 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
                         multiChannelDiscovery->persistKnownMasterChannel(opCh);
                         multiChannelDiscovery->lockMasterChannel(true);
                     }
+                } else if (workIsConfig) {
+                    channelSyncCompleted = true;
+                    masterConnected = true;
+                    masterChannel = opCh;
+                    if (multiChannelDiscovery) {
+                        multiChannelDiscovery->setCurrentChannel(opCh);
+                        multiChannelDiscovery->discardStaleOpChannel();
+                        multiChannelDiscovery->lockMasterChannel(true);
+                    }
+                    if (espNowController) {
+                        espNowController->rebindPeerOnCurrentChannel(senderMac, "Master");
+                        espNowController->setDiscoverySuppressed(true);
+                    }
+                    Serial.printf("[CHANNEL] creds canal %u — permanece, enlace fechado\n", opCh);
                 }
 
 #if SLAVE_JOIN_WIFI_AP

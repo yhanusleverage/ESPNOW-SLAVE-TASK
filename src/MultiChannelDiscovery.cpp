@@ -419,6 +419,23 @@ void MultiChannelDiscovery::setRestoreChannelDelegate(McdRestoreChannelFn fn) {
     restoreChannelDelegate = fn;
 }
 
+void MultiChannelDiscovery::discardStaleOpChannel() {
+    if (cache.lastChannel == 0 || cache.lastChannel == ESPNOW_CONFIG_CHANNEL) {
+        Serial.printf("[MCD] trabalho ch %u — NVS op já não compete\n",
+                      static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
+        return;
+    }
+    const uint8_t stale = cache.lastChannel;
+    cache.lastChannel = 0;
+    cache.usageCount = 0;
+    cache.successRate = 0;
+    if (MCD_CACHE_ENABLED) {
+        saveCacheInternal();
+    }
+    Serial.printf("[MCD] NVS op %u descartado — trabalho é ch %u\n",
+                  stale, static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
+}
+
 void MultiChannelDiscovery::persistKnownMasterChannel(uint8_t channel) {
     if (channel < MCD_MIN_CHANNEL || channel > MCD_MAX_CHANNEL) {
         return;

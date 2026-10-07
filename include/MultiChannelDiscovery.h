@@ -195,6 +195,8 @@ public:
 
     /** Persiste canal conhecido do master em NVS (evita reboot em canal errado) */
     void persistKnownMasterChannel(uint8_t channel);
+    /** Creds confirmaram trabalho no CONFIG (ch11): apaga o canal op velho (ex. 1). */
+    void discardStaleOpChannel();
     bool isMasterChannelLocked() const { return masterChannelLocked; }
 
     /**
